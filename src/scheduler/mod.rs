@@ -29,7 +29,10 @@ pub async fn worker(app: Arc<App>, fast: bool) -> anyhow::Result<()> {
                 Err(_) if uncertain => ("review", Some("transfer_uncertain"), None),
                 Err(_) if app.shutdown.is_cancelled() => ("interrupted", None, None),
                 Err(_) if token.is_cancelled() => ("cancelled", None, None),
-                Err(ref e) if e.downcast_ref::<RetryLater>().is_some() => {
+                Err(ref e)
+                    if e.downcast_ref::<RetryLater>().is_some()
+                        && app.store.attempts(&job.summary.id).await? <= 5 =>
+                {
                     let seconds = e
                         .downcast_ref::<RetryLater>()
                         .unwrap()
@@ -40,6 +43,9 @@ pub async fn worker(app: Arc<App>, fast: bool) -> anyhow::Result<()> {
                         Some("telegram_rate_limited"),
                         Some(crate::domain::unix_time() + seconds as i64),
                     )
+                }
+                Err(ref e) if e.downcast_ref::<RetryLater>().is_some() => {
+                    ("failed", Some("telegram_retries_exhausted"), None)
                 }
                 Err(ref e) => ("failed", Some(telemetry::safe_error(e)), None),
             };

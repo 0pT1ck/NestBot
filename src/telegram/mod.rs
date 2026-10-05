@@ -12,7 +12,7 @@ use grammers_client::{
 use grammers_mtsender::{ConnectionParams, InvocationError, SenderPool};
 use grammers_session::{
     Session,
-    types::{PeerId, PeerRef},
+    types::{PeerId, PeerRef, UpdateState, UpdatesState},
 };
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{Mutex, broadcast};
@@ -59,6 +59,20 @@ pub struct Account {
     update_task: tokio::task::JoinHandle<()>,
 }
 
+struct ConnectionGuard {
+    client: Client,
+    abort: tokio::task::AbortHandle,
+    armed: bool,
+}
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.client.disconnect();
+            self.abort.abort();
+        }
+    }
+}
+
 impl Drop for Account {
     fn drop(&mut self) {
         self.client.disconnect();
@@ -98,11 +112,46 @@ impl Account {
         let pool_task = tokio::spawn(async move {
             let _ = runner.run().await;
         });
+        let mut guard = ConnectionGuard {
+            client: client.clone(),
+            abort: pool_task.abort_handle(),
+            armed: true,
+        };
+        // Initialize before returning the account. Otherwise the stream's first
+        // GetState can race a fast bot reply and mark that reply as already seen.
+        let initialized = match client
+            .invoke(&grammers_tl_types::functions::updates::GetState {})
+            .await
+        {
+            Ok(grammers_tl_types::enums::updates::State::State(state)) => {
+                if let Err(error) = session
+                    .set_update_state(UpdateState::All(UpdatesState {
+                        pts: state.pts,
+                        qts: state.qts,
+                        date: state.date,
+                        seq: state.seq,
+                        channels: vec![],
+                    }))
+                    .await
+                {
+                    client.disconnect();
+                    pool_task.abort();
+                    return Err(error.into());
+                }
+                true
+            }
+            Err(InvocationError::Rpc(error)) if error.code == 401 => false,
+            Err(error) => {
+                client.disconnect();
+                pool_task.abort();
+                return Err(rpc(error));
+            }
+        };
         let stream = client
             .stream_updates(
                 updates,
                 UpdatesConfiguration {
-                    catch_up: false,
+                    catch_up: initialized,
                     update_queue_limit: Some(64),
                 },
             )
@@ -132,6 +181,7 @@ impl Account {
                 }
             }
         });
+        guard.armed = false;
         Ok(Self {
             client,
             messages,
@@ -139,6 +189,21 @@ impl Account {
             pool_task,
             update_task,
         })
+    }
+
+    pub async fn recent_replies(&self, peer: PeerRef, after: i32) -> anyhow::Result<Vec<Message>> {
+        let mut history = self.client.iter_messages(peer).limit(32);
+        let mut messages = vec![];
+        while let Some(message) = history.next().await.map_err(rpc)? {
+            if message.id() <= after {
+                break;
+            }
+            if !message.outgoing() {
+                messages.push(message);
+            }
+        }
+        messages.reverse();
+        Ok(messages)
     }
 
     pub async fn resolve(&self, ident: &str) -> anyhow::Result<PeerRef> {

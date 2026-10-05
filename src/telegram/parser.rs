@@ -87,10 +87,33 @@ pub fn parse_search(text: &str, links: &HashMap<usize, String>) -> SearchPage {
 }
 
 pub fn rate_wait(text: &str) -> Option<u64> {
-    if !["暂时", "稍后", "稍候", "请重试", "频繁", "限制", "请稍"]
-        .iter()
-        .any(|s| text.contains(s))
-    {
+    // Processing placeholders are not throttling notices. Require either an
+    // explicit rate-limit signal or a timed instruction to retry later.
+    let lower = text.to_lowercase();
+    let explicit = [
+        "频繁",
+        "限流",
+        "次数限制",
+        "速率限制",
+        "请求限制",
+        "暂时无法",
+        "稍后再试",
+        "稍后重试",
+        "稍候重试",
+        "too many requests",
+        "flood_wait",
+        "rate limit",
+    ]
+    .iter()
+    .any(|s| lower.contains(s));
+    let timed_retry = WAIT.is_match(text)
+        && ["重试", "再试", "后再", "稍后", "等待"]
+            .iter()
+            .any(|s| text.contains(s))
+        && !["处理中", "正在搜索", "正在处理", "正在获取", "正在发送"]
+            .iter()
+            .any(|s| text.contains(s));
+    if !explicit && !timed_retry {
         return None;
     }
     Some(
@@ -103,6 +126,19 @@ pub fn rate_wait(text: &str) -> Option<u64> {
             .unwrap_or(60)
             .clamp(1, 3600),
     )
+}
+
+pub fn no_search_results(text: &str) -> bool {
+    [
+        "未找到相关结果",
+        "没有找到相关结果",
+        "未找到相关文件",
+        "没有搜索结果",
+        "暂无搜索结果",
+        "没有相关结果",
+    ]
+    .iter()
+    .any(|s| text.contains(s))
 }
 
 pub fn callback(message: &grammers_client::message::Message, needles: &[&str]) -> Option<Vec<u8>> {

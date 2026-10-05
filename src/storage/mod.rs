@@ -103,7 +103,7 @@ impl Store {
 
     pub async fn recover(&self) -> anyhow::Result<()> {
         self.call(|connection| {
-            connection.execute("UPDATE jobs SET status=CASE WHEN EXISTS(SELECT 1 FROM transfers WHERE transfers.job_id=jobs.id AND transfers.status='sending') THEN 'review' ELSE 'queued' END,phase='recovered',updated_at=?1 WHERE status IN ('running','cancelling','interrupted')", [unix_time()])?;
+            connection.execute("UPDATE jobs SET status=CASE WHEN EXISTS(SELECT 1 FROM transfers WHERE transfers.job_id=jobs.id AND transfers.status='sending') THEN 'review' WHEN status='cancelling' THEN 'cancelled' ELSE 'queued' END,phase=CASE WHEN status='cancelling' THEN 'cancelled' ELSE 'recovered' END,retry_at=NULL,updated_at=?1 WHERE status IN ('running','cancelling','interrupted')", [unix_time()])?;
             connection.execute("DELETE FROM bot_updates WHERE updated_at < ?1", [unix_time() - 7*86400])?;
             Ok(())
         }).await
@@ -214,7 +214,7 @@ impl Store {
     ) -> anyhow::Result<()> {
         let (id, status, error) = (id.to_owned(), status.to_owned(), error.map(str::to_owned));
         self.call(move |c| {
-            c.execute("UPDATE jobs SET status=?2,phase=?2,error_code=?3,retry_at=?4,updated_at=?5 WHERE id=?1", params![id,status,error,retry_at,unix_time()])?;
+            c.execute("UPDATE jobs SET status=CASE WHEN status IN ('cancelled','cancelling') AND ?2!='review' THEN 'cancelled' ELSE ?2 END,phase=CASE WHEN status IN ('cancelled','cancelling') AND ?2!='review' THEN 'cancelled' ELSE ?2 END,error_code=CASE WHEN status IN ('cancelled','cancelling') AND ?2!='review' THEN NULL ELSE ?3 END,retry_at=CASE WHEN status IN ('cancelled','cancelling') THEN NULL ELSE ?4 END,updated_at=?5 WHERE id=?1", params![id,status,error,retry_at,unix_time()])?;
             Ok(())
         }).await
     }
@@ -222,7 +222,7 @@ impl Store {
     pub async fn cancel(&self, id: &str) -> anyhow::Result<()> {
         let id = id.to_owned();
         self.call(move |c| {
-            c.execute("UPDATE jobs SET status=CASE WHEN status='running' THEN 'cancelling' ELSE 'cancelled' END,updated_at=?2 WHERE id=?1 AND status IN ('queued','waiting','running','interrupted')", params![id,unix_time()])?;
+            c.execute("UPDATE jobs SET status=CASE WHEN status='running' THEN 'cancelling' ELSE 'cancelled' END,retry_at=NULL,updated_at=?2 WHERE id=?1 AND status IN ('queued','waiting','running','interrupted')", params![id,unix_time()])?;
             Ok(())
         }).await
     }
@@ -236,13 +236,21 @@ impl Store {
             let uncertain: u32=tx.query_row("SELECT count(*) FROM transfers WHERE job_id=?1 AND status='sending'", [&id], |r|r.get(0))?;
             anyhow::ensure!(uncertain==0 || allow_uncertain, "transfer_uncertain");
             if allow_uncertain { tx.execute("DELETE FROM transfers WHERE job_id=?1 AND status='sending'", [&id])?; }
-            tx.execute("UPDATE jobs SET status='queued',error_code=NULL,retry_at=NULL,updated_at=?2 WHERE id=?1", params![id,unix_time()])?;
+            tx.execute("UPDATE jobs SET status='queued',error_code=NULL,retry_at=NULL,attempts=0,updated_at=?2 WHERE id=?1", params![id,unix_time()])?;
             tx.commit()?; Ok(())
         }).await
     }
 
     pub async fn clear_queue(&self) -> anyhow::Result<u64> {
         self.call(|c| Ok(c.execute("UPDATE jobs SET status='cancelled',phase='cancelled',updated_at=?1 WHERE status IN ('queued','waiting','interrupted')", [unix_time()])? as u64)).await
+    }
+
+    pub async fn attempts(&self, id: &str) -> anyhow::Result<u32> {
+        let id = id.to_owned();
+        self.call(move |c| {
+            Ok(c.query_row("SELECT attempts FROM jobs WHERE id=?1", [id], |r| r.get(0))?)
+        })
+        .await
     }
 
     pub async fn save_page(

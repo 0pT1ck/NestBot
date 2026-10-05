@@ -43,16 +43,24 @@ async fn collect(
     let mut next_button = None;
     let mut clicked = VecDeque::new();
     let mut fresh_navigation = None;
+    let mut poll = tokio::time::interval(Duration::from_secs(3));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut updates_open = true;
     loop {
         if Instant::now() >= deadline {
             break;
         }
-        let event = tokio::select! {_=cancel.cancelled()=>anyhow::bail!("cancelled"),event=tokio::time::timeout(Duration::from_secs(2),receiver.recv())=>event};
+        let event = tokio::select! {
+            _=cancel.cancelled()=>anyhow::bail!("cancelled"),
+            _=poll.tick()=>None,
+            event=receiver.recv(), if updates_open=>Some(event),
+        };
         let mut messages = Vec::new();
         match event {
-            Ok(Ok(message)) => messages.push(message),
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+            Some(Ok(message)) => messages.push(message),
+            None | Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
                 let mut history = account.client.iter_messages(peer);
+                let mut newest_id = last_id;
                 while let Some(message) = bounded(&cancel, request_timeout, async {
                     history.next().await.map_err(rpc)
                 })
@@ -61,6 +69,7 @@ async fn collect(
                     if message.id() <= last_id {
                         break;
                     }
+                    newest_id = newest_id.max(message.id());
                     if !message.outgoing()
                         && let Some(media) = message.media().and_then(|m| transfer::media_id(&m))
                         && store.inbox_push(&job, &claim, message.id(), &media).await?
@@ -73,17 +82,22 @@ async fn collect(
                         messages.push(message);
                     }
                 }
+                // Only a complete history scan advances this cursor. Broadcast
+                // delivery may skip messages and must not advance the scan boundary.
+                last_id = newest_id;
                 messages.reverse();
             }
-            _ => {}
+            Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                updates_open = false;
+            }
         }
         for message in messages {
             if message.peer_id() != peer.id || message.outgoing() || message.id() <= after {
                 continue;
             }
             last = Instant::now();
-            last_id = last_id.max(message.id());
             if count == 0
+                && message.media().is_none()
                 && let Some(seconds) = parser::rate_wait(message.text())
             {
                 return Err(RetryLater { seconds }.into());
@@ -145,7 +159,7 @@ async fn collect(
             {
                 next_button = Some((message, data));
             }
-            if next_button.is_none() && last.elapsed() >= Duration::from_secs(8) {
+            if count > 0 && next_button.is_none() && last.elapsed() >= Duration::from_secs(8) {
                 break;
             }
         }

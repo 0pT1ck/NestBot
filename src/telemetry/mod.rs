@@ -23,6 +23,7 @@ pub fn safe_error(error: &anyhow::Error) -> &'static str {
         "transfer_uncertain" => "transfer_uncertain",
         "claim_incomplete" => "claim_incomplete",
         "telegram_timeout" => "telegram_timeout",
+        "telegram_retries_exhausted" => "telegram_retries_exhausted",
         "search_no_results" => "search_no_results",
         "invalid_config" => "invalid_config",
         "service_already_running" => "service_already_running",

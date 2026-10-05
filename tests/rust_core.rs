@@ -375,6 +375,91 @@ fn configuration_rejects_unbounded_or_exposed_defaults() {
     assert!(config.validate().is_err());
 }
 
+#[test]
+fn processing_notices_are_not_limits_and_empty_search_is_recognized() {
+    use nestbot::telegram::parser;
+    for text in [
+        "请稍候",
+        "正在搜索，请稍候……",
+        "正在获取文件，请稍后",
+        "正在处理，预计等待 10 秒",
+    ] {
+        assert_eq!(parser::rate_wait(text), None, "{text}");
+    }
+    assert_eq!(parser::rate_wait("请求过于频繁，请稍后再试"), Some(60));
+    assert_eq!(parser::rate_wait("请等待 1048 秒后重试"), Some(1048));
+    assert!(parser::no_search_results(
+        "🔎 搜索词：synthetic\n🔍 未找到相关结果"
+    ));
+}
+
+#[tokio::test]
+async fn cancellation_survives_finish_races_and_restart_without_requeue() {
+    let (_dir, store) = fixture(4);
+    let id = store
+        .enqueue(search("cancelled"), None, None)
+        .await
+        .unwrap();
+    store.next_job().await.unwrap().unwrap();
+    store.cancel(&id).await.unwrap();
+    store
+        .finish(&id, "waiting", Some("telegram_rate_limited"), Some(0))
+        .await
+        .unwrap();
+    store.recover().await.unwrap();
+    assert_eq!(store.job(&id).await.unwrap().unwrap().status, "cancelled");
+    assert!(store.job(&id).await.unwrap().unwrap().retry_at.is_none());
+    assert!(store.next_job().await.unwrap().is_none());
+    let second = store
+        .enqueue(search("cancelled-on-reboot"), None, None)
+        .await
+        .unwrap();
+    store.next_job().await.unwrap().unwrap();
+    store.cancel(&second).await.unwrap();
+    store.recover().await.unwrap();
+    assert_eq!(
+        store.job(&second).await.unwrap().unwrap().status,
+        "cancelled"
+    );
+    assert!(store.next_job().await.unwrap().is_none());
+    let uncertain = store
+        .enqueue(search("cancelled-but-uncertain"), None, None)
+        .await
+        .unwrap();
+    store.next_job().await.unwrap().unwrap();
+    store
+        .transfer_intent("scope-cancel", "d:synthetic", &uncertain, false)
+        .await
+        .unwrap();
+    store.cancel(&uncertain).await.unwrap();
+    store.recover().await.unwrap();
+    assert_eq!(
+        store.job(&uncertain).await.unwrap().unwrap().status,
+        "review"
+    );
+    assert!(store.next_job().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn manual_retry_resets_attempt_counter_but_waiting_keeps_it() {
+    let (_dir, store) = fixture(4);
+    let id = store.enqueue(search("limits"), None, None).await.unwrap();
+    for attempt in 1..=6 {
+        assert_eq!(store.next_job().await.unwrap().unwrap().summary.id, id);
+        assert_eq!(store.attempts(&id).await.unwrap(), attempt);
+        store
+            .finish(&id, "waiting", Some("telegram_rate_limited"), Some(0))
+            .await
+            .unwrap();
+    }
+    store
+        .finish(&id, "failed", Some("telegram_retries_exhausted"), None)
+        .await
+        .unwrap();
+    store.retry(&id, false).await.unwrap();
+    assert_eq!(store.attempts(&id).await.unwrap(), 0);
+}
+
 #[tokio::test]
 async fn media_inbox_is_durable_deduplicated_and_paged() {
     let (dir, store) = fixture(5);
