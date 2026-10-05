@@ -1,0 +1,112 @@
+# 中文：复制为 config/nestbot.toml 后填写；请保留字段名，修改配置后重启服务。
+# English: Copy to config/nestbot.toml; keep field names unchanged and restart after editing.
+# 中文：凭据放在 secrets.env，通过 --env-file config/secrets.env 加载。
+# English: Store credentials in secrets.env and load with --env-file config/secrets.env.
+
+# 中文：默认转存目标，可填聊天 ID（如 "-1001234567890"）或公开用户名（如 "@my_channel"）。
+#       留空时需在 Bot、CLI 或 Web 中指定目标；首次测试建议使用测试频道。
+# English: Default destination: a chat ID or public @username. If empty, select a destination
+#          in Bot, CLI or Web. Use a test channel for initial testing.
+default_target = ""
+# 中文：copy = 引用复制，避免下载；deep = 下载后重新上传，消耗磁盘和带宽。
+#       deep 不保证免于 Telegram 文件清理；保存过的默认偏好可覆盖这里的初始值。
+# English: copy reuses media references; deep downloads and uploads, using disk and bandwidth.
+#          deep does not guarantee immunity from Telegram cleanup. Saved preferences override this initial value.
+default_mode = "copy"
+
+[paths]
+# 中文：数据库、加密账号会话及 master.key 所在目录。备份数据库时也要安全备份主密钥。
+# English: Directory for the database, encrypted sessions and master.key. Back up the master key too.
+# 中文：以下相对路径以启动程序时的工作目录为基准；Linux 服务建议使用绝对路径。
+# English: Relative paths use the process working directory; use absolute paths for Linux services.
+data = ".local/data"
+# 中文：deep 转存的临时媒体目录，需要足够的磁盘空间，与内存容量无关。
+# English: Temporary media directory for deep transfers; requires disk space, independently of RAM.
+cache = ".local/cache"
+# 中文：CLI 控制接口及服务发现文件目录，CLI 与服务必须使用同一份路径配置。
+# English: Local control socket/discovery directory; CLI and service must use the same paths.
+run = ".local/run"
+
+[telegram]
+# 中文：在 my.telegram.org 的 API development tools 获取数字 API ID；不是 Bot Token 或用户 ID。
+#       0 可用于无 Telegram 的 Web 测试；账号登录、搜索及 deep 转存需要有效 API ID。
+# English: Numeric API ID from my.telegram.org API development tools, not a bot token or user ID.
+#          0 allows Web-only testing; account login, search and deep transfers require a valid API ID.
+api_id = 0
+# 中文：API Hash 的环境变量名，实际值填写在 secrets.env 的 TELEGRAM_API_HASH 中。
+# English: Environment variable name for the API hash; put its value in secrets.env.
+api_hash_env = "TELEGRAM_API_HASH"
+# 中文：Bot Token 的环境变量名；未提供 Token 时不启动 Telegram Bot，CLI/Web 仍可运行。
+# English: Environment variable name for the bot token. Without a token, Bot is disabled; CLI/Web remain available.
+bot_token_env = "TELEGRAM_BOT_TOKEN"
+# 中文：允许使用 Bot 的 Telegram 数字用户 ID，例如 [123456789, 987654321]。
+#       不是用户名、手机号或目标群 ID；空数组拒绝所有 Bot 用户，不控制 Web 登录。
+# English: Numeric Telegram user IDs allowed to use Bot, e.g. [123456789, 987654321].
+#          Not usernames, phone numbers or destination IDs. Empty denies all Bot users; Web has separate login.
+allowed_users = []
+# 中文：搜索机器人用户名，不含 t.me 链接；example 是占位符，请替换为实际机器人。
+# English: Search bot username, not a t.me URL; replace the example placeholder with your bot.
+search_bot = "example"
+# 中文：领取文件的机器人用户名；example 是占位符，请替换为实际机器人。
+# English: File retrieval bot username; replace the example placeholder with your bot.
+file_bot = "example"
+# 中文：代理 URL 的环境变量名；留空值或未设置表示直连，当前 MTProto 仅支持 SOCKS5。
+# English: Environment variable name for the proxy URL; unset/empty means direct connection. MTProto supports SOCKS5 only.
+proxy_env = "NESTBOT_PROXY"
+
+[web]
+# 中文：是否启动 Web 管理；false 时仅运行 CLI 和已配置的 Bot。
+# English: Enable Web administration; false runs only CLI and the configured Bot.
+enabled = true
+# 中文：默认只监听本机，浏览器访问 http://127.0.0.1:8787；此处只能填 IP:端口。
+#       VPS 可通过 SSH 隧道访问；0.0.0.0 会监听所有 IPv4 网络接口。
+# English: Loopback-only by default; browse to http://127.0.0.1:8787. Use an IP:port here.
+#          Access a VPS through an SSH tunnel; 0.0.0.0 listens on all IPv4 interfaces.
+listen = "127.0.0.1:8787"
+# 中文：Web 管理密码的环境变量名；Web 启用时必须提供至少 12 字符的密码。
+# English: Environment variable name for the Web password; at least 12 characters required when Web is enabled.
+password_env = "NESTBOT_ADMIN_PASSWORD"
+# 中文：数据库解锁密码的环境变量名，CLI/Bot/Web 共用；即使 Web 禁用也需要此密码。
+#       已初始化后不可直接更换，否则无法解锁原主密钥；当前没有密码更换命令。
+# English: Environment variable for the shared database password, required even with Web disabled.
+#          Do not change it after initialization: the existing master key will not unlock. No password-change command yet.
+vault_password_env = "VAULT_PASSWORD"
+# 中文：是否要求浏览器仅通过 HTTPS 发送登录 Cookie。本机 HTTP 测试保持 false。
+#       true 不会自动启用 HTTPS，需要由可信反向代理提供 HTTPS。
+# English: Send login cookies over HTTPS only. Keep false for local HTTP testing.
+#          true does not enable HTTPS itself; a trusted reverse proxy must provide HTTPS.
+secure_cookie = false
+# 中文：是否允许监听非本机地址；开启时同时要求 secure_cookie=true，并配置 HTTPS。
+# English: Allow a non-loopback bind address; requires secure_cookie=true and HTTPS configuration.
+allow_remote = false
+
+[limits]
+# 中文：未结束任务总数上限（包括运行、等待和待核对），可填 1–4096；达到上限后拒绝新任务。
+# English: Maximum unfinished jobs, including running, waiting and review; range 1–4096. New jobs are rejected when full.
+max_queue = 1024
+# 中文：临时媒体总容量上限，单位字节；默认 5 GiB，必须不小于 max_file_bytes。
+# English: Total temporary media limit in bytes; default 5 GiB, must be at least max_file_bytes.
+max_cache_bytes = 5368709120
+# 中文：下载前要求磁盘在容纳预计文件后仍至少剩余的空间，单位字节；默认 256 MiB。
+# English: Minimum disk space to retain after allowing for the expected download, in bytes; default 256 MiB.
+reserve_disk_bytes = 268435456
+# 中文：deep 下载的单文件大小上限，单位字节；默认 4 GiB，不代表 Telegram 账号支持相同上传上限。
+# English: Maximum single deep-download size in bytes; default 4 GiB, not a guarantee of your account's upload allowance.
+max_file_bytes = 4294967296
+# 中文：SQLite 页缓存，单位 KiB；默认 8192 = 8 MiB，允许 1024–32768。不是整个进程的内存上限。
+# English: SQLite page cache in KiB; default 8192 = 8 MiB, range 1024–32768. Not a process-wide RAM limit.
+sqlite_cache_kib = 8192
+# 中文：一次领取中等待文件机器人下发媒体及翻组的最长时间，单位秒，至少 10。
+#       不包括后续全部文件的下载上传耗时；数量很多或下发慢时可适当调大。
+# English: Maximum collection time for bot media and group navigation, in seconds, minimum 10.
+#          Excludes the time to transfer all collected files; increase for large or slow deliveries.
+claim_timeout_secs = 300
+# 中文：传输无进度超时，单位秒，至少 10；慢速或不稳定网络可适当调大。
+# English: Transfer stall timeout in seconds, minimum 10; increase for slow or unstable connections.
+transfer_stall_secs = 60
+# 中文：单次协议请求超时，单位秒，至少 10；不是整个任务的最长运行时间。
+# English: Individual protocol request timeout in seconds, minimum 10; not an overall job deadline.
+request_timeout_secs = 90
+# 中文：Bot 长轮询等待时间，单位秒，允许 10–50；没有消息时等待，避免频繁轮询。
+# English: Bot long-poll wait in seconds, range 10–50; waits for updates to avoid frequent polling.
+poll_secs = 30

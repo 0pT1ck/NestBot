@@ -1,0 +1,31 @@
+default_target = ""
+default_mode = "copy"
+
+[paths]
+data = "/var/lib/nestbot"
+cache = "/var/cache/nestbot"
+run = "/run/nestbot"
+
+[telegram]
+api_id = 0
+allowed_users = []
+# Replace these placeholders with your search and file retrieval bot usernames.
+search_bot = "example"
+file_bot = "example"
+
+[web]
+enabled = true
+listen = "127.0.0.1:8787"
+secure_cookie = false
+allow_remote = false
+
+[limits]
+max_queue = 1024
+max_cache_bytes = 5368709120
+reserve_disk_bytes = 268435456
+max_file_bytes = 4294967296
+sqlite_cache_kib = 8192
+claim_timeout_secs = 300
+transfer_stall_secs = 60
+request_timeout_secs = 90
+poll_secs = 30
