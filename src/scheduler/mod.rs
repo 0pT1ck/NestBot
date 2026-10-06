@@ -24,6 +24,11 @@ pub async fn worker(app: Arc<App>, fast: bool) -> anyhow::Result<()> {
             tracing::info!(event="job_started",job_id=%job.summary.id,kind=%job.summary.kind);
             let result = app.execute(&job, &token).await;
             let uncertain = app.store.has_uncertain(&job.summary.id).await?;
+            let rate_wait = result
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<RetryLater>())
+                .map(|wait| wait.seconds);
             let (status, error, retry) = match result {
                 Ok(()) => ("completed", None, None),
                 Err(_) if uncertain => ("review", Some("transfer_uncertain"), None),
@@ -47,6 +52,9 @@ pub async fn worker(app: Arc<App>, fast: bool) -> anyhow::Result<()> {
                 use teloxide::prelude::*;
                 let report = app.store.report(&job.summary.id).await?;
                 let mut progress = String::new();
+                if let Some(seconds) = rate_wait {
+                    progress.push_str(&format!("\nTelegram 要求等待 {seconds} 秒；短期限流已自动等待，长等待或连续限流暂停本次任务。已完成部分保留，等待后可重新执行原命令续传。"));
+                }
                 if report.pages > 0 {
                     progress.push_str(&format!("\n已保存 {} 页搜索结果。", report.pages));
                 }
