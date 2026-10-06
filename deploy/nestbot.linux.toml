@@ -27,5 +27,8 @@ max_file_bytes = 4294967296
 sqlite_cache_kib = 8192
 claim_timeout_secs = 300
 transfer_stall_secs = 60
+# 单文件总超时 / Per-file total timeout, as in Python.
+download_timeout_secs = 1800
+upload_timeout_secs = 1800
 request_timeout_secs = 90
 poll_secs = 30

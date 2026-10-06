@@ -45,6 +45,16 @@ impl Store {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.execute_batch(&format!("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA cache_size=-{cache_kib}; PRAGMA temp_store=FILE; PRAGMA wal_autocheckpoint=256;"))?;
         connection.execute_batch(include_str!("../../migrations/001_initial.sql"))?;
+        connection.execute_batch(include_str!("../../migrations/002_behavior.sql"))?;
+        let grouped = connection
+            .prepare("PRAGMA table_info(claim_inbox)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|s| s == "group_id");
+        if !grouped {
+            connection.execute("ALTER TABLE claim_inbox ADD COLUMN group_id INTEGER", [])?;
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -103,7 +113,7 @@ impl Store {
 
     pub async fn recover(&self) -> anyhow::Result<()> {
         self.call(|connection| {
-            connection.execute("UPDATE jobs SET status=CASE WHEN EXISTS(SELECT 1 FROM transfers WHERE transfers.job_id=jobs.id AND transfers.status='sending') THEN 'review' WHEN status='cancelling' THEN 'cancelled' ELSE 'queued' END,phase=CASE WHEN status='cancelling' THEN 'cancelled' ELSE 'recovered' END,retry_at=NULL,updated_at=?1 WHERE status IN ('running','cancelling','interrupted')", [unix_time()])?;
+            connection.execute("UPDATE jobs SET status=CASE WHEN EXISTS(SELECT 1 FROM transfers WHERE transfers.job_id=jobs.id AND transfers.status='sending') THEN 'review' WHEN status='cancelling' THEN 'cancelled' ELSE 'queued' END,phase=CASE WHEN EXISTS(SELECT 1 FROM transfers WHERE transfers.job_id=jobs.id AND transfers.status='sending') THEN 'review' WHEN status='cancelling' THEN 'cancelled' ELSE 'recovered' END,retry_at=NULL,updated_at=?1 WHERE status IN ('running','cancelling','interrupted')", [unix_time()])?;
             connection.execute("DELETE FROM bot_updates WHERE updated_at < ?1", [unix_time() - 7*86400])?;
             Ok(())
         }).await
@@ -126,11 +136,11 @@ impl Store {
             let prior=tx.query_row("SELECT id,payload FROM jobs WHERE album_key=?1 AND status='waiting' AND phase='album'",[&album_key],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Vec<u8>>(1)?))).optional()?;
             let id=if let Some((id,body))=prior {
                 let mut previous:JobPayload=serde_json::from_slice(&vault.decrypt(&format!("job:{id}"),&body)?)?;
-                if let (JobPayload::Incoming{message_ids:old,caption:old_caption,..},JobPayload::Incoming{message_ids,caption,..})=(&mut previous,&payload) {
+                if let (JobPayload::Incoming{message_ids:old,caption:old_caption,caption_message:old_carrier,..},JobPayload::Incoming{message_ids,caption,caption_message,..})=(&mut previous,&payload) {
                     for id in message_ids {if !old.contains(id){old.push(*id);}}
                     old.sort_unstable();
                     anyhow::ensure!(old.len()<=10,"invalid_album");
-                    if old_caption.is_none() {*old_caption=caption.clone();}
+                    if old_caption.as_deref().is_none_or(str::is_empty) {*old_caption=caption.clone();*old_carrier = *caption_message;}
                 }
                 let body=vault.encrypt(&format!("job:{id}"),&Zeroizing::new(serde_json::to_vec(&previous)?))?;
                 tx.execute("UPDATE jobs SET payload=?2,retry_at=?3,updated_at=?4 WHERE id=?1",params![id,body,unix_time()+2,unix_time()])?;
@@ -446,6 +456,204 @@ impl Store {
         .await
     }
 
+    pub async fn claim_record(&self, payload: &str) -> anyhow::Result<ClaimRecord> {
+        use sha2::{Digest, Sha256};
+        let id = self.vault.index("claim", payload);
+        let legacy = format!("{:x}", Sha256::digest(payload.as_bytes()))[..32].to_owned();
+        let vault = self.vault.clone();
+        self.call(move |c| {
+            if let Some(body) = c
+                .query_row("SELECT body FROM claims WHERE id=?1", [&id], |r| {
+                    r.get::<_, Vec<u8>>(0)
+                })
+                .optional()?
+            {
+                return Ok(serde_json::from_slice(
+                    &vault.decrypt(&format!("claim:{id}"), &body)?,
+                )?);
+            }
+            if let Some(body) = c
+                .query_row(
+                    "SELECT body FROM legacy_claims WHERE id=?1",
+                    [&legacy],
+                    |r| r.get::<_, Vec<u8>>(0),
+                )
+                .optional()?
+            {
+                return Ok(serde_json::from_slice(
+                    &vault.decrypt(&format!("legacy:{legacy}"), &body)?,
+                )?);
+            }
+            Ok(ClaimRecord::default())
+        })
+        .await
+    }
+
+    pub async fn select_page(
+        &self,
+        job: &str,
+        batch: &str,
+        entries: &[Entry],
+    ) -> anyhow::Result<()> {
+        let (job, batch) = (job.to_owned(), batch.to_owned());
+        let hashes = entries
+            .iter()
+            .map(|e| self.vault.index("payload", &e.payload()))
+            .collect::<Vec<_>>();
+        self.call(move|c| {let tx=c.transaction()?;for hash in hashes {
+            tx.execute("INSERT OR IGNORE INTO search_selection SELECT ?1,batch_id,seq FROM entries WHERE batch_id=?2 AND payload_hash=?3",params![job,batch,hash])?;
+        }tx.commit()?;Ok(())}).await
+    }
+
+    pub async fn selected_entries(
+        &self,
+        job: &str,
+        batch: &str,
+        start: u32,
+        limit: u32,
+    ) -> anyhow::Result<Vec<(u32, Entry)>> {
+        let (job, batch) = (job.to_owned(), batch.to_owned());
+        let vault = self.vault.clone();
+        self.call(move|c|{let mut stmt=c.prepare("SELECT e.seq,e.payload_hash,e.body FROM entries e JOIN search_selection s ON s.batch_id=e.batch_id AND s.seq=e.seq WHERE s.job_id=?1 AND e.batch_id=?2 AND e.seq>=?3 ORDER BY e.seq LIMIT ?4")?;
+            let rows=stmt.query_map(params![job,batch,start,limit.min(100)],|r|Ok((r.get::<_,u32>(0)?,r.get::<_,String>(1)?,r.get::<_,Vec<u8>>(2)?)))?;
+            let mut out=vec![];for row in rows {let(seq,hash,body)=row?;out.push((seq,serde_json::from_slice(&vault.decrypt(&format!("entry:{batch}:{hash}"),&body)?)?));}Ok(out)
+        }).await
+    }
+
+    pub async fn album_intent(
+        &self,
+        scope: &str,
+        media: &[String],
+        job: &str,
+        redo: bool,
+    ) -> anyhow::Result<()> {
+        let (scope, media, job) = (scope.to_owned(), media.to_vec(), job.to_owned());
+        self.call(move|c|{let tx=c.transaction()?;for id in media {
+            let previous=tx.query_row("SELECT status FROM transfers WHERE scope=?1 AND media_id=?2",params![scope,id],|r|r.get::<_,String>(0)).optional()?;
+            anyhow::ensure!(previous.as_deref()!=Some("sending"),"transfer_uncertain");
+            anyhow::ensure!(redo || previous.as_deref()!=Some("done"),"already_transferred");
+            tx.execute("INSERT INTO transfers VALUES(?1,?2,?3,'sending',NULL,?4) ON CONFLICT(scope,media_id) DO UPDATE SET job_id=excluded.job_id,status='sending',target_message=NULL,updated_at=excluded.updated_at",params![scope,id,job,unix_time()])?;
+        }tx.commit()?;Ok(())}).await
+    }
+    pub async fn album_done(&self, scope: &str, sent: &[(String, i32)]) -> anyhow::Result<()> {
+        let (scope, sent) = (scope.to_owned(), sent.to_vec());
+        self.call(move|c|{let tx=c.transaction()?;for(id,target)in sent {
+            tx.execute("UPDATE transfers SET status='done',target_message=?3,updated_at=?4 WHERE scope=?1 AND media_id=?2",params![scope,id,target,unix_time()])?;
+        }tx.commit()?;Ok(())}).await
+    }
+
+    pub async fn selection_count(&self, job: &str) -> anyhow::Result<u32> {
+        let job = job.to_owned();
+        self.call(move |c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM search_selection WHERE job_id=?1",
+                [job],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+    }
+    pub async fn callback(&self, owner: i64, value: &serde_json::Value) -> anyhow::Result<String> {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let body = self
+            .vault
+            .encrypt(&format!("callback:{id}"), &serde_json::to_vec(value)?)?;
+        self.call(move |c| {
+            let tx = c.transaction()?;
+            tx.execute("DELETE FROM bot_callbacks WHERE expires<?1", [unix_time()])?;
+            tx.execute(
+                "INSERT INTO bot_callbacks VALUES(?1,?2,?3,?4)",
+                params![id, owner, unix_time() + 172800, body],
+            )?;
+            tx.commit()?;
+            Ok(format!("C:{id}"))
+        })
+        .await
+    }
+    pub async fn callback_value(
+        &self,
+        owner: i64,
+        id: &str,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        let id = id.to_owned();
+        let vault = self.vault.clone();
+        self.call(move |c| {
+            let body = c
+                .query_row(
+                    "SELECT body FROM bot_callbacks WHERE id=?1 AND owner=?2 AND expires>=?3",
+                    params![id, owner, unix_time()],
+                    |r| r.get::<_, Vec<u8>>(0),
+                )
+                .optional()?;
+            body.map(|body| {
+                Ok(serde_json::from_slice(
+                    &vault.decrypt(&format!("callback:{id}"), &body)?,
+                )?)
+            })
+            .transpose()
+        })
+        .await
+    }
+
+    pub async fn save_claim(&self, payload: &str, record: &ClaimRecord) -> anyhow::Result<()> {
+        let id = self.vault.index("claim", payload);
+        let body = self
+            .vault
+            .encrypt(&format!("claim:{id}"), &serde_json::to_vec(record)?)?;
+        self.call(move |c| {
+            c.execute(
+                "INSERT INTO claims VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body",
+                params![id, body],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn media_seen(&self, job: &str, media: &str) -> anyhow::Result<bool> {
+        let (job, media) = (job.to_owned(), media.to_owned());
+        self.call(move |c| {
+            Ok(c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM job_media_seen WHERE job_id=?1 AND media_id=?2)",
+                params![job, media],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+    }
+
+    pub async fn mark_media_seen(&self, job: &str, media: &str) -> anyhow::Result<()> {
+        let (job, media) = (job.to_owned(), media.to_owned());
+        self.call(move |c| {
+            c.execute(
+                "INSERT OR IGNORE INTO job_media_seen VALUES(?1,?2)",
+                params![job, media],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn report(&self, job: &str) -> anyhow::Result<JobReport> {
+        Ok(self
+            .preference(&format!("report:{job}"))
+            .await?
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?
+            .unwrap_or_default())
+    }
+    pub async fn save_report(&self, job: &str, report: &JobReport) -> anyhow::Result<()> {
+        self.set_preference(&format!("report:{job}"), &serde_json::to_string(report)?)
+            .await
+    }
+    pub async fn warning(&self, job: &str, code: &str) -> anyhow::Result<()> {
+        let mut report = self.report(job).await?;
+        if !report.warnings.iter().any(|s| s == code) {
+            report.warnings.push(code.into());
+        }
+        self.save_report(job, &report).await
+    }
+
     pub async fn inbox_push(
         &self,
         job: &str,
@@ -453,8 +661,29 @@ impl Store {
         message: i32,
         media: &str,
     ) -> anyhow::Result<bool> {
+        self.inbox_push_group(job, claim, message, media, None)
+            .await
+    }
+
+    pub async fn inbox_push_group(
+        &self,
+        job: &str,
+        claim: &str,
+        message: i32,
+        media: &str,
+        group: Option<i64>,
+    ) -> anyhow::Result<bool> {
         let (job, claim, media) = (job.to_owned(), claim.to_owned(), media.to_owned());
-        self.call(move|c|Ok(c.execute("INSERT OR IGNORE INTO claim_inbox(job_id,claim,message_id,media_id) VALUES(?1,?2,?3,?4)",params![job,claim,message,media])?!=0)).await
+        self.call(move|c|Ok(c.execute("INSERT OR IGNORE INTO claim_inbox(job_id,claim,message_id,media_id,group_id) VALUES(?1,?2,?3,?4,?5)",params![job,claim,message,media,group])?!=0)).await
+    }
+
+    pub async fn inbox_next(&self, job: &str, claim: &str) -> anyhow::Result<Vec<i32>> {
+        let (job, claim) = (job.to_owned(), claim.to_owned());
+        self.call(move|c|{let first=c.query_row("SELECT message_id,group_id FROM claim_inbox WHERE job_id=?1 AND claim=?2 AND processed=0 ORDER BY message_id LIMIT 1",params![job,claim],|r|Ok((r.get::<_,i32>(0)?,r.get::<_,Option<i64>>(1)?))).optional()?;
+            let Some((id,group))=first else{return Ok(vec![]);};
+            if let Some(group)=group {let mut stmt=c.prepare("SELECT message_id FROM claim_inbox WHERE job_id=?1 AND claim=?2 AND group_id=?3 AND processed=0 ORDER BY message_id LIMIT 10")?;return Ok(stmt.query_map(params![job,claim,group],|r|r.get(0))?.collect::<Result<Vec<_>,_>>()?);}
+            Ok(vec![id])
+        }).await
     }
 
     pub async fn inbox_pending(&self, job: &str, claim: &str) -> anyhow::Result<Vec<i32>> {

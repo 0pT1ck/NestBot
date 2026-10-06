@@ -203,6 +203,7 @@ async fn album_fragments_are_persisted_as_one_bounded_job() {
         mode: TransferMode::Copy,
         target: "-1000000000001".into(),
         caption: None,
+        caption_message: None,
     };
     let id = store
         .enqueue_album(incoming(5), 42, "album", 1)
@@ -518,6 +519,7 @@ async fn fast_copy_lane_can_run_while_main_job_is_running() {
                 mode: TransferMode::Copy,
                 target: "-1001234567890".into(),
                 caption: None,
+                caption_message: None,
             },
             None,
             None,

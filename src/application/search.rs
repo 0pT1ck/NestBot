@@ -79,14 +79,22 @@ fn page_ready(message: &Message, previous: Option<&Message>) -> anyhow::Result<P
     {
         return Ok(PageState::End);
     }
-    anyhow::ensure!(
-        !parser::no_search_results(message.text()),
-        "search_no_results"
-    );
-    if let Some(seconds) = parser::rate_wait(message.text()) {
-        return Err(RetryLater { seconds }.into());
+    if previous.is_some()
+        && previous.is_some_and(|p| p.raw != message.raw)
+        && !processing(message.text())
+    {
+        return Ok(PageState::Ready);
+    }
+    if previous.is_none() && (page.is_result() || parser::no_search_results(message.text())) {
+        return Ok(PageState::Ready);
     }
     Ok(PageState::Pending)
+}
+
+fn processing(text: &str) -> bool {
+    ["正在搜索", "正在处理", "正在获取", "处理中", "正在加载"]
+        .iter()
+        .any(|s| text.contains(s))
 }
 
 async fn wait_page(
@@ -98,12 +106,24 @@ async fn wait_page(
     timeout: u64,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Option<Message>> {
-    let deadline = Instant::now() + Duration::from_secs(timeout);
+    let mut deadline = Instant::now() + Duration::from_secs(timeout);
     let mut next_poll = Instant::now();
     let mut updates_open = true;
+    let mut best: Option<Message> = None;
+    let mut seen = std::collections::BTreeMap::new();
+    let mut last_new = Instant::now();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        anyhow::ensure!(!remaining.is_zero(), "telegram_timeout");
+        if remaining.is_zero()
+            || (previous.is_none()
+                && best.is_some()
+                && last_new.elapsed() >= Duration::from_secs(35))
+        {
+            if previous.is_none() && best.is_some() {
+                return Ok(best);
+            }
+            anyhow::bail!("telegram_timeout");
+        }
         tokio::select! {
             _=cancel.cancelled()=>anyhow::bail!("cancelled"),
             result=tokio::time::timeout(remaining.min(Duration::from_secs(3)),async {
@@ -111,6 +131,11 @@ async fn wait_page(
             })=>{
                 match result {
                     Ok(Ok(message)) if message.peer_id()==peer.id && !message.outgoing() && (message.id()>after || previous.is_some_and(|p|p.id()==message.id()))=>{
+                        let first_reply = seen.is_empty();
+                        if observe(&mut seen, &mut best, &message) {
+                            if previous.is_none() && first_reply {deadline=Instant::now()+Duration::from_secs(timeout);}
+                            last_new=Instant::now();
+                        }
                         match page_ready(&message, previous)? {
                             PageState::Ready => return Ok(Some(message)),
                             PageState::End => return Ok(None),
@@ -126,6 +151,11 @@ async fn wait_page(
                 // including the initial response and edits to processing placeholders.
                 let messages = bounded(cancel,remaining.as_secs().max(1).min(timeout),account.poll(peer, after, previous.map(Message::id))).await?;
                 for message in messages {
+                    let first_reply = seen.is_empty();
+                    if observe(&mut seen, &mut best, &message) {
+                        if previous.is_none() && first_reply {deadline=Instant::now()+Duration::from_secs(timeout);}
+                        last_new=Instant::now();
+                    }
                     match page_ready(&message, previous)? {
                         PageState::Ready => return Ok(Some(message)),
                         PageState::End => return Ok(None),
@@ -135,6 +165,44 @@ async fn wait_page(
             }
         }
     }
+}
+
+fn observe(
+    seen: &mut std::collections::BTreeMap<i32, Message>,
+    best: &mut Option<Message>,
+    message: &Message,
+) -> bool {
+    if seen
+        .get(&message.id())
+        .is_some_and(|old| old.raw == message.raw)
+    {
+        return false;
+    }
+    seen.insert(message.id(), message.clone());
+    while seen.len() > 128 {
+        seen.pop_first();
+    }
+    // Python chooses the most result-like message, rather than the latest
+    // service notice. History replay must not restart the quiet window.
+    let score = |m: &Message| {
+        (
+            !parse(m).entries.is_empty(),
+            m.text().contains("密钥"),
+            m.text().contains("搜索词") || m.text().contains('第'),
+            m.text().chars().count(),
+        )
+    };
+    *best = seen
+        .values()
+        .fold(None, |best: Option<&Message>, m| {
+            if best.is_none_or(|old| score(m) > score(old)) {
+                Some(m)
+            } else {
+                best
+            }
+        })
+        .cloned();
+    true
 }
 
 pub async fn run(
@@ -175,6 +243,15 @@ pub async fn run(
         .await?;
     }
     let reused = reply.is_some();
+    // An expired cursor or missing next button falls back to a fresh search
+    // which skips pages already present in the database.
+    if reply
+        .as_ref()
+        .is_some_and(|m| parser::callback(m, &["下一页"]).is_none())
+    {
+        reply = None;
+    }
+    let reused = reused && reply.is_some();
     if reply.is_none() {
         let sent = bounded(cancel, timeout, async {
             account
@@ -197,8 +274,46 @@ pub async fn run(
             .await?
             .ok_or_else(|| anyhow::anyhow!("search_no_results"))?,
         );
+        if reply
+            .as_ref()
+            .is_some_and(|m| !parse(m).is_result() && !parser::no_search_results(m.text()))
+        {
+            bounded(cancel, timeout, async {
+                account
+                    .client
+                    .send_message(peer, "/start")
+                    .await
+                    .map_err(rpc)
+            })
+            .await?;
+            bounded(cancel, timeout, async {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                Ok(())
+            })
+            .await?;
+            let sent = bounded(cancel, timeout, async {
+                account
+                    .client
+                    .send_message(peer, keyword)
+                    .await
+                    .map_err(rpc)
+            })
+            .await?;
+            reply = wait_page(
+                account.as_ref(),
+                &mut receiver,
+                peer,
+                sent.id(),
+                None,
+                timeout,
+                cancel,
+            )
+            .await?;
+        }
     }
-    let mut reply = reply.unwrap();
+    let Some(mut reply) = reply else {
+        return Ok(());
+    };
     if !resume && let Some(sort) = sort {
         let needles = match sort {
             "time" => vec!["时间"],
@@ -207,7 +322,7 @@ pub async fn run(
         };
         if let Some(data) = parser::callback(&reply, &needles) {
             bounded(cancel, timeout, account.click(peer, &reply, data)).await?;
-            reply = wait_page(
+            let sorted = wait_page(
                 account.as_ref(),
                 &mut receiver,
                 peer,
@@ -217,12 +332,20 @@ pub async fn run(
                 cancel,
             )
             .await?
-            .unwrap_or(reply);
+            .unwrap_or_else(|| reply.clone());
+            if sorted.id() == reply.id() {
+                reply = sorted;
+            } else {
+                app.store
+                    .warning(&job.summary.id, "search_sort_notice_ignored")
+                    .await?;
+            }
         }
     }
     let minimum = cursor.map(|(page, _)| page + 1).unwrap_or(1);
     let mut collected = 0u32;
     let mut first = reused;
+    let mut retries = 0;
     loop {
         if !first {
             let page = parser::parse_search(
@@ -234,11 +357,23 @@ pub async fn run(
             );
             let current = page.page.unwrap_or(minimum + collected);
             if current >= minimum {
-                anyhow::ensure!(!page.entries.is_empty(), "search_no_results");
+                if page.entries.is_empty() {
+                    app.store
+                        .warning(&job.summary.id, "search_no_results")
+                        .await?;
+                    break;
+                }
+                let batch = app
+                    .store
+                    .save_page(keyword, current, Some(reply.id()), page.entries.clone())
+                    .await?;
                 app.store
-                    .save_page(keyword, current, Some(reply.id()), page.entries)
+                    .select_page(&job.summary.id, &batch, &page.entries)
                     .await?;
                 collected += 1;
+                let mut report = app.store.report(&job.summary.id).await?;
+                report.pages = collected;
+                app.store.save_report(&job.summary.id, &report).await?;
                 app.progress(
                     &job.summary.id,
                     "search",
@@ -260,51 +395,120 @@ pub async fn run(
             Ok(())
         })
         .await?;
-        let answer = bounded(cancel, timeout, account.click(peer, &reply, data))
-            .await
-            .map_err(|error| partial_timeout(error, collected))?;
+        let answer = match bounded(cancel, timeout, account.click(peer, &reply, data)).await {
+            Ok(answer) => answer,
+            Err(error) if error.downcast_ref::<RetryLater>().is_some() => return Err(error),
+            Err(error) if cancel.is_cancelled() => return Err(error),
+            Err(_) => {
+                app.store
+                    .warning(&job.summary.id, "search_page_stalled")
+                    .await?;
+                break;
+            }
+        };
         if answer.as_deref().is_some_and(parser::search_end) {
             break;
         }
-        if let Some(seconds) = answer.as_deref().and_then(parser::rate_wait) {
-            return Err(RetryLater { seconds }.into());
-        }
-        let next = wait_page(
-            account.as_ref(),
-            &mut receiver,
-            peer,
-            reply.id(),
-            Some(&reply),
-            timeout,
-            cancel,
-        )
-        .await
-        .map_err(|error| partial_timeout(error, collected))?;
+        let next = if answer.as_deref().and_then(parser::rate_wait).is_some() {
+            Some(reply.clone())
+        } else {
+            match wait_page(
+                account.as_ref(),
+                &mut receiver,
+                peer,
+                reply.id(),
+                Some(&reply),
+                timeout,
+                cancel,
+            )
+            .await
+            {
+                Ok(next) => next,
+                Err(error) if error.downcast_ref::<RetryLater>().is_some() => return Err(error),
+                Err(error) if cancel.is_cancelled() => return Err(error),
+                Err(_) => {
+                    app.store
+                        .warning(&job.summary.id, "search_page_stalled")
+                        .await?;
+                    break;
+                }
+            }
+        };
         let Some(next) = next else {
             break;
         };
+        if parse(&next).entries.is_empty() || next.raw == reply.raw {
+            retries += 1;
+            if retries > 20 {
+                app.store
+                    .warning(&job.summary.id, "search_retries_exhausted")
+                    .await?;
+                break;
+            }
+            app.progress(
+                &job.summary.id,
+                "search_waiting",
+                collected as u64,
+                pages.map(u64::from),
+            )
+            .await?;
+            bounded(cancel, 61, async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(())
+            })
+            .await?;
+            first = true;
+            continue;
+        }
+        retries = 0;
         reply = next;
     }
     Ok(())
 }
 
-fn partial_timeout(error: anyhow::Error, collected: u32) -> anyhow::Error {
-    if error.to_string() == "telegram_timeout" && collected > 0 {
-        anyhow::anyhow!("search_partial_timeout")
-    } else {
-        error
-    }
+fn parse(message: &Message) -> parser::SearchPage {
+    parser::parse_search(
+        message.text(),
+        &parser::line_links(
+            message.text(),
+            message.fmt_entities().map(Vec::as_slice).unwrap_or(&[]),
+        ),
+    )
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use grammers_client::{Client, message::InputMessage};
     use grammers_mtsender::{ConnectionParams, SenderPool};
     use grammers_session::{storages::MemorySession, types::PeerId};
     use std::sync::{Arc, Mutex};
 
-    fn message(text: &str) -> Message {
+    #[test]
+    fn history_replay_does_not_reset_quiet_time_and_best_reply_matches_python() {
+        let mut seen = std::collections::BTreeMap::new();
+        let mut best = None;
+        let mut result = message("🔎 搜索词：synthetic\n第 1 页，等待中");
+        if let grammers_tl_types::enums::Message::Message(raw) = &mut result.raw {
+            raw.id = 101;
+        }
+        let mut notice = message("处理中");
+        if let grammers_tl_types::enums::Message::Message(raw) = &mut notice.raw {
+            raw.id = 102;
+        }
+        assert!(observe(&mut seen, &mut best, &result));
+        assert!(observe(&mut seen, &mut best, &notice));
+        assert_eq!(best.as_ref().unwrap().id(), 101);
+        assert!(!observe(&mut seen, &mut best, &result));
+        assert!(!observe(&mut seen, &mut best, &notice));
+        if let grammers_tl_types::enums::Message::Message(raw) = &mut result.raw {
+            raw.message = "🔎 搜索词：synthetic\n密钥：synthetic-key\n第 1 页".into();
+        }
+        assert!(observe(&mut seen, &mut best, &result));
+        assert!(best.as_ref().unwrap().text().contains("synthetic-key"));
+    }
+
+    pub(crate) fn message(text: &str) -> Message {
         let SenderPool { handle, .. } = SenderPool::with_configuration(
             Arc::new(MemorySession::default()),
             1,
@@ -494,7 +698,7 @@ mod tests {
         let peer = empty.peer_ref().await.unwrap().unwrap();
         let (tx, mut rx) = broadcast::channel(4);
         drop(tx);
-        let error = wait_page(
+        let received = wait_page(
             &History(Mutex::new(vec![empty])),
             &mut rx,
             peer,
@@ -504,9 +708,9 @@ mod tests {
             &CancellationToken::new(),
         )
         .await
-        .unwrap_err();
-        assert_eq!(error.to_string(), "search_no_results");
-        assert!(error.downcast_ref::<RetryLater>().is_none());
+        .unwrap()
+        .unwrap();
+        assert!(parser::no_search_results(received.text()));
         let cancel = CancellationToken::new();
         cancel.cancel();
         let error = wait_page(

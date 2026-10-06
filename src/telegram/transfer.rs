@@ -4,7 +4,7 @@ use crate::{
     telegram::{Account, bounded, rpc},
 };
 use grammers_client::{
-    media::{Attribute, Media},
+    media::Media,
     message::{InputMessage, Message},
 };
 use grammers_session::types::PeerRef;
@@ -120,7 +120,13 @@ async fn download(
     Ok(current)
 }
 
-fn document_info(media: &Media) -> (String, String, Vec<Attribute>) {
+fn document_info(
+    media: &Media,
+) -> (
+    String,
+    String,
+    Vec<grammers_tl_types::enums::DocumentAttribute>,
+) {
     let doc = match media {
         Media::Document(d) => Some(d),
         Media::Sticker(s) => Some(&s.document),
@@ -129,32 +135,17 @@ fn document_info(media: &Media) -> (String, String, Vec<Attribute>) {
     let Some(doc) = doc else {
         return ("photo.jpg".into(), "image/jpeg".into(), vec![]);
     };
-    let mut attrs = vec![];
-    if let Some(grammers_tl_types::enums::Document::Document(document)) = &doc.raw.document {
-        for attr in &document.attributes {
-            use grammers_tl_types::enums::DocumentAttribute as A;
-            match attr {
-                A::Filename(name) => attrs.push(Attribute::FileName(name.file_name.clone())),
-                A::Video(video) => attrs.push(Attribute::Video {
-                    round_message: video.round_message,
-                    supports_streaming: video.supports_streaming,
-                    duration: Duration::from_secs_f64(video.duration.max(0.0)),
-                    w: video.w,
-                    h: video.h,
-                }),
-                A::Audio(audio) if audio.voice => attrs.push(Attribute::Voice {
-                    duration: Duration::from_secs(audio.duration.max(0) as u64),
-                    waveform: audio.waveform.clone(),
-                }),
-                A::Audio(audio) => attrs.push(Attribute::Audio {
-                    duration: Duration::from_secs(audio.duration.max(0) as u64),
-                    title: audio.title.clone(),
-                    performer: audio.performer.clone(),
-                }),
-                _ => {}
-            }
-        }
-    }
+    let attrs =
+        if let Some(grammers_tl_types::enums::Document::Document(document)) = &doc.raw.document {
+            document
+                .attributes
+                .iter()
+                .filter(|a| !matches!(a, grammers_tl_types::enums::DocumentAttribute::Sticker(_)))
+                .cloned()
+                .collect()
+        } else {
+            vec![]
+        };
     (
         doc.name().unwrap_or("file.bin").into(),
         doc.mime_type().unwrap_or("application/octet-stream").into(),
@@ -162,10 +153,12 @@ fn document_info(media: &Media) -> (String, String, Vec<Attribute>) {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upload(
     app: &App,
     job: &Job,
     sender: &Account,
+    source: &Account,
     media: &Media,
     path: &Path,
     size: u64,
@@ -199,12 +192,81 @@ async fn upload(
     let mut input = if matches!(media, Media::Photo(_)) {
         InputMessage::new().photo(uploaded)
     } else {
-        InputMessage::new().document(uploaded).mime_type(&mime)
+        InputMessage::new().media(grammers_tl_types::types::InputMediaUploadedDocument {
+            nosound_video: false,
+            force_file: false,
+            spoiler: false,
+            file: uploaded.raw,
+            thumb: None,
+            mime_type: mime,
+            attributes: attrs,
+            stickers: None,
+            ttl_seconds: None,
+            video_cover: None,
+            video_timestamp: None,
+        })
     };
-    for attr in attrs {
-        input = input.attribute(attr);
+    let document = match media {
+        Media::Document(d) => Some(d),
+        Media::Sticker(s) => Some(&s.document),
+        _ => None,
+    };
+    if let Some(thumb) = document.and_then(|d| {
+        d.thumbs()
+            .into_iter()
+            .rev()
+            .find(|t| t.size() > 0 && t.size() <= 1024 * 1024)
+    }) {
+        let temp = path.with_extension("thumb.jpg");
+        let result = bounded(cancel, 60, async {
+            source
+                .client
+                .download_media(&thumb, &temp)
+                .await
+                .map_err(rpc)?;
+            let uploaded = sender
+                .client
+                .upload_file(&temp)
+                .await
+                .map_err(|_| anyhow::anyhow!("upload_failed"))?;
+            Ok(uploaded)
+        })
+        .await;
+        let _ = tokio::fs::remove_file(temp).await;
+        if cancel.is_cancelled() {
+            anyhow::bail!("cancelled");
+        }
+        if let Ok(uploaded) = result {
+            input = input.thumbnail(uploaded);
+        }
     }
     Ok(input)
+}
+
+pub fn caption(job: &Job, original: &str, tag: Option<&str>) -> String {
+    let options = match &job.payload {
+        crate::domain::JobPayload::Transfer { options, .. } => options.clone(),
+        _ => Default::default(),
+    };
+    let text = if options.keep_caption {
+        original.to_owned()
+    } else {
+        String::new()
+    };
+    if options.tag_key
+        && let Some(tag) = tag
+    {
+        format!(
+            "🔑 {tag}{}",
+            if text.is_empty() {
+                String::new()
+            } else {
+                format!("\n{text}")
+            }
+        )
+    } else {
+        text
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -217,6 +279,8 @@ pub async fn one(
     message: &Message,
     scope: &str,
     redo: bool,
+    tag: Option<&str>,
+    mode: TransferMode,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Option<i32>> {
     let Some(media) = message.media() else {
@@ -231,11 +295,6 @@ pub async fn one(
             return Ok(target_id);
         }
     }
-    let mode = match &job.payload {
-        crate::domain::JobPayload::Transfer { mode, .. }
-        | crate::domain::JobPayload::Incoming { mode, .. } => *mode,
-        _ => TransferMode::Copy,
-    };
     let mut path: Option<PathBuf> = None;
     let prepare=async {
         let input=match mode {
@@ -243,17 +302,19 @@ pub async fn one(
             TransferMode::Deep=>{
                 let temp=app.config.paths.cache.join(format!("{}-{}.part",job.summary.id,app.store.vault.index("media",&id)));
                 path=Some(temp.clone());
-                let size=download(app,job,account,&media,&temp,cancel).await?;
-                upload(app,job,sender,&media,&temp,size,cancel).await?
+                let size=bounded(cancel,app.config.limits.download_timeout_secs,download(app,job,account,&media,&temp,cancel)).await?;
+                bounded(cancel,app.config.limits.upload_timeout_secs,upload(app,job,sender,account,&media,&temp,size,cancel)).await?
             }
-        }.text(message.text()).fmt_entities(message.fmt_entities().cloned().unwrap_or_default());
+        };
+        let caption=caption(job,message.text(),tag);
+        let input=input.text(&caption).fmt_entities(if mode==TransferMode::Copy && caption==message.text() {message.fmt_entities().cloned().unwrap_or_default()} else {vec![]});
         app.store.transfer_intent(scope,&id,&job.summary.id,redo).await?;
         let result=bounded(cancel,app.config.limits.request_timeout_secs,async {sender.client.send_message(target,input).await.map_err(rpc)}).await;
         let sent=match result {
             Ok(sent)=>sent,
             Err(e)=>{
                 // A flood-wait rejection is definitive: no target message was sent.
-                if e.downcast_ref::<super::RetryLater>().is_some() {
+                if e.downcast_ref::<super::RetryLater>().is_some() || e.downcast_ref::<super::TelegramRejected>().is_some() {
                     let (scope,id)=(scope.to_owned(),id.clone());
                     app.store.call(move|c|{c.execute("DELETE FROM transfers WHERE scope=?1 AND media_id=?2 AND status='sending'",rusqlite::params![scope,id])?;Ok(())}).await?;
                 }
@@ -270,6 +331,77 @@ pub async fn one(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub async fn album(
+    app: &App,
+    job: &Job,
+    sender: &Account,
+    target: PeerRef,
+    messages: &[Message],
+    scope: &str,
+    redo: bool,
+    tag: Option<&str>,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Vec<i32>> {
+    use grammers_client::media::InputMedia;
+    let mut ids = vec![];
+    let mut inputs = vec![];
+    for message in messages {
+        let media = message
+            .media()
+            .ok_or_else(|| anyhow::anyhow!("source_media_missing"))?;
+        ids.push(media_id(&media).ok_or_else(|| anyhow::anyhow!("source_media_missing"))?);
+        let text = caption(job, message.text(), tag);
+        inputs.push(
+            InputMedia::new()
+                .copy_media(&media)
+                .caption(&text)
+                .fmt_entities(if text == message.text() {
+                    message.fmt_entities().cloned().unwrap_or_default()
+                } else {
+                    vec![]
+                }),
+        );
+    }
+    app.store
+        .album_intent(scope, &ids, &job.summary.id, redo)
+        .await?;
+    let result = bounded(cancel, app.config.limits.request_timeout_secs, async {
+        sender.client.send_album(target, inputs).await.map_err(rpc)
+    })
+    .await;
+    let sent = match result {
+        Ok(sent) => sent,
+        Err(error) => {
+            if error.downcast_ref::<super::RetryLater>().is_some()
+                || error.downcast_ref::<super::TelegramRejected>().is_some()
+            {
+                let (scope, ids) = (scope.to_owned(), ids.clone());
+                app.store.call(move|c|{for id in ids{c.execute("DELETE FROM transfers WHERE scope=?1 AND media_id=?2 AND status='sending'",rusqlite::params![scope,id])?;}Ok(())}).await?;
+            }
+            return Err(error);
+        }
+    };
+    anyhow::ensure!(
+        sent.len() == ids.len() && sent.iter().all(Option::is_some),
+        "transfer_uncertain"
+    );
+    let sent = sent
+        .into_iter()
+        .flatten()
+        .map(|m| m.id())
+        .collect::<Vec<_>>();
+    app.store
+        .album_done(
+            scope,
+            &ids.into_iter()
+                .zip(sent.iter().copied())
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+    Ok(sent)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn incoming(
     app: &App,
     job: &Job,
@@ -278,6 +410,7 @@ pub async fn incoming(
     mode: TransferMode,
     target: &str,
     caption: Option<&str>,
+    caption_message: Option<i32>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
     if mode == TransferMode::Copy {
@@ -315,9 +448,26 @@ pub async fn incoming(
                 ids.iter().copied().map(MessageId),
             )
             .await
-            .map_err(|_| anyhow::anyhow!("bot_copy_failed"))
+            .map_err(|error| match error {
+                teloxide::RequestError::Api(_)
+                | teloxide::RequestError::MigrateToChatId(_)
+                | teloxide::RequestError::RetryAfter(_) => {
+                    anyhow::Error::new(super::TelegramRejected)
+                }
+                _ => anyhow::anyhow!("bot_copy_failed"),
+            })
         })
-        .await?;
+        .await;
+        let copied = match copied {
+            Ok(copied) => copied,
+            Err(error) => {
+                if error.downcast_ref::<super::TelegramRejected>().is_some() {
+                    let (scope, media) = (scope.clone(), media.clone());
+                    app.store.call(move |c| {c.execute("DELETE FROM transfers WHERE scope=?1 AND media_id=?2 AND status='sending'",rusqlite::params![scope,media])?;Ok(())}).await?;
+                }
+                return Err(error);
+            }
+        };
         anyhow::ensure!(copied.len() == ids.len(), "transfer_uncertain");
         let first = copied
             .first()
@@ -328,12 +478,13 @@ pub async fn incoming(
         for (source, sent) in ids.iter().zip(copied) {
             originals.push((*source, sent.0));
         }
-        crate::interfaces::bot::remember_media(
+        crate::interfaces::bot::remember_media_carrier(
             app,
             source_chat,
             target,
             &originals,
             caption.unwrap_or(""),
+            caption_message,
         )
         .await?;
         app.progress(
@@ -379,10 +530,13 @@ pub async fn incoming(
                 .map_err(rpc)
         })
         .await?;
-        anyhow::ensure!(messages.iter().all(Option::is_some), "source_media_missing");
-        let mut saved = Vec::new();
-        for message in messages.into_iter().flatten() {
-            if let Some(id) = one(
+        let mut report = app.store.report(&job.summary.id).await?;
+        for message in messages {
+            let Some(message) = message else {
+                report.failed_files += 1;
+                continue;
+            };
+            let result = one(
                 app,
                 job,
                 &account,
@@ -391,21 +545,37 @@ pub async fn incoming(
                 &message,
                 &scope,
                 false,
+                None,
+                mode,
                 cancel,
             )
-            .await?
-            {
-                saved.push((message.id(), id));
+            .await;
+            match result {
+                Ok(Some(id)) => {
+                    report.files += 1;
+                    crate::interfaces::bot::remember_media(
+                        app,
+                        source_chat,
+                        target,
+                        &[(message.id(), id)],
+                        message.text(),
+                    )
+                    .await?;
+                }
+                Ok(None) => report.failed_files += 1,
+                Err(error) => {
+                    if cancel.is_cancelled()
+                        || error.downcast_ref::<super::RetryLater>().is_some()
+                        || app.store.has_uncertain(&job.summary.id).await?
+                    {
+                        return Err(error);
+                    }
+                    report.failed_files += 1;
+                }
             }
+            app.store.save_report(&job.summary.id, &report).await?;
         }
-        crate::interfaces::bot::remember_media(
-            app,
-            source_chat,
-            target,
-            &saved,
-            caption.unwrap_or(""),
-        )
-        .await?;
+        app.store.save_report(&job.summary.id, &report).await?;
         Ok(())
     }
 }

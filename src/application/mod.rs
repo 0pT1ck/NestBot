@@ -106,6 +106,7 @@ impl App {
             .store
             .preference("target")
             .await?
+            .filter(|s| !s.is_empty())
             .unwrap_or_else(|| self.config.default_target.clone()))
     }
     pub async fn mode(&self) -> anyhow::Result<TransferMode> {
@@ -133,37 +134,110 @@ impl App {
                 target,
                 redo,
                 dry_run,
+                options,
             } => {
+                let mut options = options.clone();
+                let current_target = if job.reply_chat.is_some() {
+                    Some(self.target().await?)
+                } else {
+                    None
+                };
+                let target = current_target
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(target);
+                let searched = if let Some(keyword) = &options.keyword {
+                    search::run(
+                        self,
+                        job,
+                        keyword,
+                        options.pages,
+                        options.sort.as_deref(),
+                        false,
+                        cancel,
+                    )
+                    .await?;
+                    options.selection = Some(job.summary.id.clone());
+                    Some(self.store.vault.index("keyword", keyword))
+                } else {
+                    None
+                };
+                let batch = batch.as_ref().or(searched.as_ref());
+                let mode =
+                    if batch.is_some() && options.selection.is_none() && job.reply_chat.is_some() {
+                        self.mode().await?
+                    } else {
+                        *mode
+                    };
+                let mut processed = 0;
                 if let Some(batch) = batch {
+                    if !redo
+                        && !options.confirmed
+                        && options.selection.is_none()
+                        && !crate::interfaces::bot::batch_confirmation(
+                            self, job, batch, *start, *end,
+                        )
+                        .await?
+                    {
+                        return Ok(());
+                    }
                     let mut offset = *start;
+                    if options.selection.is_none() {
+                        anyhow::ensure!(
+                            !self.store.entries(batch, offset, 1).await?.is_empty(),
+                            "invalid_range"
+                        );
+                    }
                     loop {
-                        let entries = self.store.entries(batch, offset, 32).await?;
+                        let entries = if let Some(selection) = &options.selection {
+                            self.store
+                                .selected_entries(selection, batch, offset, 32)
+                                .await?
+                        } else {
+                            self.store.entries(batch, offset, 32).await?
+                        };
                         if entries.is_empty() {
                             break;
                         }
                         for (seq, entry) in entries {
+                            if options
+                                .limit
+                                .is_some_and(|limit| limit > 0 && processed >= limit)
+                            {
+                                return Ok(());
+                            }
                             if end.is_some_and(|end| seq > end) {
                                 return Ok(());
                             }
                             claim::run(
                                 self,
                                 job,
-                                &entry.payload(),
+                                &if options.use_key {
+                                    entry.key.trim().into()
+                                } else {
+                                    entry.payload()
+                                },
                                 entry.file_count,
-                                *mode,
+                                mode,
                                 target,
                                 *redo,
                                 *dry_run,
                                 cancel,
                             )
                             .await?;
+                            processed += 1;
                             offset = seq + 1;
                         }
                     }
                     Ok(())
                 } else {
+                    let mut seen = std::collections::HashSet::new();
                     for key in keys {
-                        claim::run(self, job, key, None, *mode, target, *redo, *dry_run, cancel)
+                        let key = key.trim();
+                        if key.is_empty() || !seen.insert(key) {
+                            continue;
+                        }
+                        claim::run(self, job, key, None, mode, target, *redo, *dry_run, cancel)
                             .await?;
                     }
                     Ok(())
@@ -175,15 +249,22 @@ impl App {
                 mode,
                 target,
                 caption,
+                caption_message,
             } => {
+                let destination = if *mode == TransferMode::Deep {
+                    self.target().await?
+                } else {
+                    target.clone()
+                };
                 crate::telegram::transfer::incoming(
                     self,
                     job,
                     *source_chat,
                     message_ids,
                     *mode,
-                    target,
+                    &destination,
                     caption.as_deref(),
+                    *caption_message,
                     cancel,
                 )
                 .await

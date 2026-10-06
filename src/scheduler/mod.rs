@@ -29,23 +29,8 @@ pub async fn worker(app: Arc<App>, fast: bool) -> anyhow::Result<()> {
                 Err(_) if uncertain => ("review", Some("transfer_uncertain"), None),
                 Err(_) if app.shutdown.is_cancelled() => ("interrupted", None, None),
                 Err(_) if token.is_cancelled() => ("cancelled", None, None),
-                Err(ref e)
-                    if e.downcast_ref::<RetryLater>().is_some()
-                        && app.store.attempts(&job.summary.id).await? <= 5 =>
-                {
-                    let seconds = e
-                        .downcast_ref::<RetryLater>()
-                        .unwrap()
-                        .seconds
-                        .clamp(1, 86400);
-                    (
-                        "waiting",
-                        Some("telegram_rate_limited"),
-                        Some(crate::domain::unix_time() + seconds as i64),
-                    )
-                }
                 Err(ref e) if e.downcast_ref::<RetryLater>().is_some() => {
-                    ("failed", Some("telegram_retries_exhausted"), None)
+                    ("failed", Some("telegram_rate_limited"), None)
                 }
                 Err(ref e) => ("failed", Some(telemetry::safe_error(e)), None),
             };
@@ -60,28 +45,20 @@ pub async fn worker(app: Arc<App>, fast: bool) -> anyhow::Result<()> {
             tracing::info!(event="job_finished",job_id=%job.summary.id,status,error_code=error);
             if let (Some(bot), Some(chat)) = (&app.bot, job.reply_chat) {
                 use teloxide::prelude::*;
-                let progress = if job.summary.kind == "search" {
-                    let saved = app
-                        .store
-                        .job(&job.summary.id)
-                        .await?
-                        .map(|j| j.completed)
-                        .unwrap_or(0);
-                    if saved > 0 {
-                        format!(
-                            "\n已保存 {saved} 页搜索结果。{}",
-                            if error == Some("search_partial_timeout") {
-                                "翻页未确认完成，可用 /search 关键词 continue 继续。"
-                            } else {
-                                ""
-                            }
-                        )
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    String::new()
-                };
+                let report = app.store.report(&job.summary.id).await?;
+                let mut progress = String::new();
+                if report.pages > 0 {
+                    progress.push_str(&format!("\n已保存 {} 页搜索结果。", report.pages));
+                }
+                if job.summary.kind == "transfer" {
+                    progress.push_str(&format!("\n成功 {} 个文件，续传/重复跳过 {} 个文件，已完成跳过 {} 个密钥；失败 {} 个密钥、{} 个文件。",report.files,report.skipped_files,report.skipped_keys,report.failed_keys,report.failed_files));
+                }
+                if !report.warnings.is_empty() {
+                    progress.push_str(&format!(
+                        "\n提示：{}（已完成部分保留）",
+                        report.warnings.join(", ")
+                    ));
+                }
                 let _ = bot
                     .send_message(
                         ChatId(chat),
@@ -94,6 +71,11 @@ pub async fn worker(app: Arc<App>, fast: bool) -> anyhow::Result<()> {
                         ),
                     )
                     .await;
+                if status == "completed"
+                    && let crate::domain::JobPayload::Search { keyword, .. } = &job.payload
+                {
+                    crate::interfaces::bot::search_result(&app, &job, keyword).await?;
+                }
             }
         } else {
             tokio::select! {_=app.shutdown.cancelled()=>break,_=notified=>{},_=tokio::time::sleep(Duration::from_secs(1))=>{}}

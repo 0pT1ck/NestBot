@@ -68,8 +68,10 @@ pub enum Command {
     },
     Search {
         keyword: String,
-        #[arg(long)]
+        #[arg(long, default_value = "1")]
         pages: Option<u32>,
+        #[arg(long)]
+        all: bool,
         #[arg(long)]
         sort: Option<String>,
         #[arg(long)]
@@ -77,6 +79,22 @@ pub enum Command {
     },
     Fetch {
         keys: Vec<String>,
+        #[arg(long="keys", num_args=1..)]
+        direct_keys: Vec<String>,
+        #[arg(long)]
+        keyword: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long)]
+        use_key: bool,
+        #[arg(long)]
+        no_caption: bool,
+        #[arg(long)]
+        tag_key: bool,
+        #[arg(long, default_value_t = 1)]
+        pages: u32,
+        #[arg(long)]
+        sort: Option<String>,
         #[arg(long, value_enum, default_value = "deep")]
         mode: Mode,
         #[arg(long)]
@@ -345,18 +363,27 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 Command::Search {
                     keyword,
                     pages,
+                    all,
                     sort,
                     resume,
                 } => Action::Submit {
                     payload: JobPayload::Search {
                         keyword,
-                        pages,
+                        pages: if all { None } else { pages.map(|n| n.max(1)) },
                         sort,
                         resume,
                     },
                 },
                 Command::Fetch {
                     keys,
+                    direct_keys,
+                    keyword,
+                    limit,
+                    use_key,
+                    no_caption,
+                    tag_key,
+                    pages,
+                    sort,
                     mode,
                     target,
                     batch,
@@ -365,6 +392,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     redo,
                     dry_run,
                 } => {
+                    let mut keys = keys;
+                    keys.extend(direct_keys);
+                    let keyword = keyword.or_else(|| {
+                        if batch.is_none()
+                            && keys.len() == 1
+                            && !crate::interfaces::commands::looks_like_key(&keys[0])
+                        {
+                            Some(keys.remove(0))
+                        } else {
+                            None
+                        }
+                    });
                     let target = if let Some(target) = target {
                         target
                     } else {
@@ -384,6 +423,16 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     };
                     Action::Submit {
                         payload: JobPayload::Transfer {
+                            options: crate::domain::TransferOptions {
+                                keyword,
+                                limit,
+                                use_key,
+                                keep_caption: !no_caption,
+                                tag_key,
+                                pages: Some(pages.max(1)),
+                                sort,
+                                ..Default::default()
+                            },
                             keys,
                             batch,
                             start,

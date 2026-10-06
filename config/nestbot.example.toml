@@ -44,6 +44,9 @@ bot_token_env = "TELEGRAM_BOT_TOKEN"
 # English: Numeric Telegram user IDs allowed to use Bot, e.g. [123456789, 987654321].
 #          Not usernames, phone numbers or destination IDs. Empty denies all Bot users; Web has separate login.
 allowed_users = []
+# 中文：设为 true 时，Bot 搜索结果中的关键词和描述打码显示。
+# English: Mask keywords and descriptions in Bot search results when true.
+mask_output = false
 # 中文：搜索机器人用户名，不含 t.me 链接；example 是占位符，请替换为实际机器人。
 # English: Search bot username, not a t.me URL; replace the example placeholder with your bot.
 search_bot = "example"
@@ -104,6 +107,10 @@ claim_timeout_secs = 300
 # 中文：传输无进度超时，单位秒，至少 10；慢速或不稳定网络可适当调大。
 # English: Transfer stall timeout in seconds, minimum 10; increase for slow or unstable connections.
 transfer_stall_secs = 60
+# 中文：单个文件下载/上传的总超时；默认与 Python 版相同，各 1800 秒。
+# English: Overall download/upload timeout per file; each defaults to Python's 1800 seconds.
+download_timeout_secs = 1800
+upload_timeout_secs = 1800
 # 中文：单次协议请求超时，单位秒，至少 10；不是整个任务的最长运行时间。
 # English: Individual protocol request timeout in seconds, minimum 10; not an overall job deadline.
 request_timeout_secs = 90

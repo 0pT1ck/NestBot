@@ -28,6 +28,7 @@ Web 默认地址：http://127.0.0.1:8787。管理密码至少 12 字符；密钥
 ```powershell
 .\target\release\nestbot.exe status
 .\target\release\nestbot.exe search "合成关键词" --pages 2
+.\target\release\nestbot.exe search "合成关键词" --all
 .\target\release\nestbot.exe search "合成关键词" --resume
 .\target\release\nestbot.exe fetch synthetic-key --mode copy --target=-1001234567890
 .\target\release\nestbot.exe batches
@@ -40,6 +41,8 @@ Web 默认地址：http://127.0.0.1:8787。管理密码至少 12 字符；密钥
 ```
 
 `entries` 会显示本人需要查看的明文，请勿把输出贴进公开日志。`retry --allow-uncertain` 必须先检查目标是否已经收到文件，重试可能产生重复副本。
+
+CLI 搜索默认一页；Bot `/search` 默认搜全页。原 Python 业务规则的对齐范围、数据库兼容与离线测试记录见 [Python 行为对齐](docs/python-parity.md)。
 
 ## Bot
 

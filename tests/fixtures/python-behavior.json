@@ -1,0 +1,455 @@
+{
+  "provenance": "Generated only from synthetic inputs with original Python functions.",
+  "source_sha256": {
+    "parser.py": "05e4f2df66e369ac3da066b357c171097d60950310bac7fa0838fc764fe2afb7",
+    "bot.py": "aa3ae540254f107a7865af8b90b9424de64dc0a60ec6038297975086c4afba44",
+    "fetcher.py": "3f06f6b68788ed54c9fb053fdd8d82bdd1e2761dd27c6a20b6fae49e2be304d8",
+    "client.py": "a7b4c196b589e4dcbbd2bfddf4478c2ea657df2dcd4894d7a76bc88e23a3cb53"
+  },
+  "cases": [
+    {
+      "kind": "parser",
+      "input": "🔎 搜索词：synthetic\n🔑 密钥：K_one\n📁 描述：first (https://t.me/example?start=p1)\n📦 文件个数：12\n热门搜索：甲｜乙 | 丙\n第 1 页 / 共 3 页",
+      "expected": {
+        "keyword": "synthetic",
+        "page": 1,
+        "total_pages": 3,
+        "hot_searches": [
+          "甲",
+          "乙",
+          "丙"
+        ],
+        "entries": [
+          {
+            "key": "K_one",
+            "description": "first",
+            "link": "https://t.me/example?start=p1",
+            "file_count": 12,
+            "page": 1
+          }
+        ],
+        "is_result": true
+      }
+    },
+    {
+      "kind": "parser",
+      "input": "🔎 搜索词：empty\n未找到相关结果\n第 1 页 / 共 1 页",
+      "expected": {
+        "keyword": "empty",
+        "page": 1,
+        "total_pages": 1,
+        "hot_searches": [],
+        "entries": [],
+        "is_result": true
+      }
+    },
+    {
+      "kind": "parser",
+      "input": "第 1 页\n密钥：K_one\n描述：plain\n第 2 页 / 共 9 页",
+      "expected": {
+        "keyword": "",
+        "page": 2,
+        "total_pages": 9,
+        "hot_searches": [],
+        "entries": [
+          {
+            "key": "K_one",
+            "description": "plain",
+            "link": "",
+            "file_count": null,
+            "page": 1
+          }
+        ],
+        "is_result": true
+      }
+    },
+    {
+      "kind": "parser",
+      "input": "🔎 搜索词：synthetic\n密钥：K_two\n描述：first\n文件个数：3\n文件个数：unknown\n未知行\n第 2 页",
+      "expected": {
+        "keyword": "synthetic",
+        "page": 2,
+        "total_pages": null,
+        "hot_searches": [],
+        "entries": [
+          {
+            "key": "K_two",
+            "description": "first",
+            "link": "",
+            "file_count": 3,
+            "page": 2
+          }
+        ],
+        "is_result": true
+      }
+    },
+    {
+      "kind": "parser",
+      "input": "欢迎，请输入关键词",
+      "expected": {
+        "keyword": "",
+        "page": null,
+        "total_pages": null,
+        "hot_searches": [],
+        "entries": [],
+        "is_result": false
+      }
+    },
+    {
+      "kind": "parser",
+      "input": "密钥无标签值\n第 1 页",
+      "expected": {
+        "keyword": "",
+        "page": 1,
+        "total_pages": null,
+        "hot_searches": [],
+        "entries": [],
+        "is_result": false
+      }
+    },
+    {
+      "kind": "search_args",
+      "input": "synthetic 2",
+      "expected": [
+        "synthetic",
+        2
+      ]
+    },
+    {
+      "kind": "search_args",
+      "input": "synthetic 50",
+      "expected": [
+        "synthetic",
+        50
+      ]
+    },
+    {
+      "kind": "search_args",
+      "input": "synthetic 99",
+      "expected": [
+        "synthetic 99",
+        null
+      ]
+    },
+    {
+      "kind": "search_args",
+      "input": "synthetic 0",
+      "expected": [
+        "synthetic 0",
+        null
+      ]
+    },
+    {
+      "kind": "search_args",
+      "input": "three words",
+      "expected": [
+        "three words",
+        null
+      ]
+    },
+    {
+      "kind": "search_args",
+      "input": "",
+      "expected": [
+        "",
+        null
+      ]
+    },
+    {
+      "kind": "fetch_args",
+      "input": "--redo K_one K_two --dry",
+      "expected": [
+        [
+          "K_one",
+          "K_two"
+        ],
+        true,
+        true
+      ]
+    },
+    {
+      "kind": "fetch_args",
+      "input": "-r K_one -d",
+      "expected": [
+        [
+          "K_one"
+        ],
+        true,
+        true
+      ]
+    },
+    {
+      "kind": "fetch_args",
+      "input": "K_one --dry-run",
+      "expected": [
+        [
+          "K_one"
+        ],
+        false,
+        true
+      ]
+    },
+    {
+      "kind": "fetch_args",
+      "input": "--unknown K_one",
+      "expected": [
+        [
+          "--unknown",
+          "K_one"
+        ],
+        false,
+        false
+      ]
+    },
+    {
+      "kind": "fetch_args",
+      "input": "",
+      "expected": [
+        [],
+        false,
+        false
+      ]
+    },
+    {
+      "kind": "key",
+      "input": "LH_abc-123",
+      "expected": true
+    },
+    {
+      "kind": "key",
+      "input": "短密钥中文示例",
+      "expected": true
+    },
+    {
+      "kind": "key",
+      "input": "has space",
+      "expected": false
+    },
+    {
+      "kind": "key",
+      "input": "/fetch x",
+      "expected": false
+    },
+    {
+      "kind": "key",
+      "input": "http://example.com",
+      "expected": false
+    },
+    {
+      "kind": "key",
+      "input": "ab",
+      "expected": false
+    },
+    {
+      "kind": "key",
+      "input": "sixkey!",
+      "expected": false
+    },
+    {
+      "kind": "key",
+      "input": "key123：x",
+      "expected": true
+    },
+    {
+      "kind": "tags",
+      "input": "#A #第二季",
+      "expected": [
+        "#A",
+        "#第二季"
+      ]
+    },
+    {
+      "kind": "tags",
+      "input": "文字 #A，#B。#A",
+      "expected": [
+        "#A",
+        "#B",
+        "#A"
+      ]
+    },
+    {
+      "kind": "tags",
+      "input": "##A #B! #C?",
+      "expected": [
+        "#A",
+        "#B",
+        "#C"
+      ]
+    },
+    {
+      "kind": "tags",
+      "input": "#A#B",
+      "expected": [
+        "#A",
+        "#B"
+      ]
+    },
+    {
+      "kind": "tags",
+      "input": "plain",
+      "expected": []
+    },
+    {
+      "kind": "caption",
+      "input": {
+        "original": "  caption  ",
+        "tags": [
+          "#A",
+          "#B"
+        ]
+      },
+      "expected": [
+        "caption\n#A #B",
+        true
+      ]
+    },
+    {
+      "kind": "caption",
+      "input": {
+        "original": "",
+        "tags": [
+          "#A"
+        ]
+      },
+      "expected": [
+        "#A",
+        true
+      ]
+    },
+    {
+      "kind": "caption",
+      "input": {
+        "original": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+        "tags": [
+          "#A"
+        ]
+      },
+      "expected": [
+        "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀\n#A",
+        true
+      ]
+    },
+    {
+      "kind": "caption",
+      "input": {
+        "original": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "tags": [
+          "#A"
+        ]
+      },
+      "expected": [
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n#A",
+        false
+      ]
+    },
+    {
+      "kind": "payload",
+      "input": {
+        "key": " fallback ",
+        "link": "https://t.me/example?start=p1"
+      },
+      "expected": "p1"
+    },
+    {
+      "kind": "payload",
+      "input": {
+        "key": " fallback ",
+        "link": "https://t.me/example?start=%20p1%20"
+      },
+      "expected": "p1"
+    },
+    {
+      "kind": "payload",
+      "input": {
+        "key": " fallback ",
+        "link": "https://t.me/example?start=&start=p2"
+      },
+      "expected": "p2"
+    },
+    {
+      "kind": "payload",
+      "input": {
+        "key": " fallback ",
+        "link": "https://t.me/example?start="
+      },
+      "expected": "fallback"
+    },
+    {
+      "kind": "payload",
+      "input": {
+        "key": " fallback ",
+        "link": ""
+      },
+      "expected": "fallback"
+    },
+    {
+      "kind": "complete",
+      "input": {
+        "record": {
+          "status": "done",
+          "files": 2
+        },
+        "expected": null
+      },
+      "expected": true
+    },
+    {
+      "kind": "complete",
+      "input": {
+        "record": {
+          "status": "done",
+          "files": 2
+        },
+        "expected": 3
+      },
+      "expected": false
+    },
+    {
+      "kind": "complete",
+      "input": {
+        "record": {
+          "status": "partial",
+          "files": 3
+        },
+        "expected": 3
+      },
+      "expected": false
+    },
+    {
+      "kind": "complete",
+      "input": {
+        "record": {
+          "status": "done",
+          "files": 3
+        },
+        "expected": 3
+      },
+      "expected": true
+    },
+    {
+      "kind": "claim_wait",
+      "input": "请等待 1048 秒后重试",
+      "expected": null
+    },
+    {
+      "kind": "claim_wait",
+      "input": "暂时无法领取，等待 30 分钟",
+      "expected": 1800
+    },
+    {
+      "kind": "claim_wait",
+      "input": "请稍候",
+      "expected": 60
+    },
+    {
+      "kind": "claim_wait",
+      "input": "正在处理，请稍候",
+      "expected": 60
+    },
+    {
+      "kind": "claim_wait",
+      "input": "普通消息",
+      "expected": null
+    }
+  ]
+}

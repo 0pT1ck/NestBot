@@ -35,6 +35,14 @@ pub async fn import_legacy(
             let blob = std::fs::read(&path)?;
             let clear = decode_legacy(&blob, password)?;
             let batch: LegacyBatch = serde_json::from_slice(&clear)?;
+            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                store
+                    .set_preference(
+                        &format!("batch_alias:{name}"),
+                        &store.vault.index("keyword", &batch.keyword),
+                    )
+                    .await?;
+            }
             store.save_page(&batch.keyword, 0, None, vec![]).await?;
             // Insert in small transactions; stable sequence numbers survive reruns.
             for chunk in batch.entries.chunks(64) {
@@ -58,6 +66,56 @@ pub async fn import_legacy(
             "legacy_state_too_large"
         );
         let prefs: serde_json::Value = serde_json::from_slice(&std::fs::read(bot)?)?;
+        if let Some(last) = prefs.get("last_batch")
+            && let Some(name) = last.get("file").and_then(|v| v.as_str())
+        {
+            if let Some(id) = store.preference(&format!("batch_alias:{name}")).await? {
+                store.set_preference("last_batch", &id).await?;
+            }
+            store
+                .set_preference(
+                    "last_batch_start",
+                    &last
+                        .get("start")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(1)
+                        .max(1)
+                        .to_string(),
+                )
+                .await?;
+        }
+        if let Some(last) = prefs.get("last_search")
+            && let Some(hash) = last
+                .get("keyword_hash")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        {
+            use sha2::{Digest, Sha256};
+            let mut offset = 0;
+            'find: loop {
+                let batches = store.batches(64, offset).await?;
+                if batches.is_empty() {
+                    break;
+                }
+                for batch in batches {
+                    let keyword = store.batch_keyword(&batch.id).await?;
+                    if format!("{:x}", Sha256::digest(keyword.as_bytes())).starts_with(hash) {
+                        store
+                            .save_page(
+                                &keyword,
+                                last.get("page").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                                last.get("result_msg_id")
+                                    .and_then(|v| v.as_i64())
+                                    .and_then(|n| i32::try_from(n).ok()),
+                                vec![],
+                            )
+                            .await?;
+                        break 'find;
+                    }
+                }
+                offset += 64;
+            }
+        }
         if let Some(target) = prefs.get("target_chat").and_then(|v| v.as_str()) {
             store.set_preference("target", target).await?;
         }

@@ -40,6 +40,7 @@ pub struct TelegramConfig {
     pub api_hash_env: String,
     pub bot_token_env: String,
     pub allowed_users: Vec<i64>,
+    pub mask_output: bool,
     pub search_bot: String,
     pub file_bot: String,
     pub proxy_env: String,
@@ -51,6 +52,7 @@ impl Default for TelegramConfig {
             api_hash_env: "TELEGRAM_API_HASH".into(),
             bot_token_env: "TELEGRAM_BOT_TOKEN".into(),
             allowed_users: vec![],
+            mask_output: false,
             search_bot: "example".into(),
             file_bot: "example".into(),
             proxy_env: "NESTBOT_PROXY".into(),
@@ -91,6 +93,8 @@ pub struct Limits {
     pub sqlite_cache_kib: u32,
     pub claim_timeout_secs: u64,
     pub transfer_stall_secs: u64,
+    pub download_timeout_secs: u64,
+    pub upload_timeout_secs: u64,
     pub request_timeout_secs: u64,
     pub poll_secs: u32,
 }
@@ -104,6 +108,8 @@ impl Default for Limits {
             sqlite_cache_kib: 8192,
             claim_timeout_secs: 300,
             transfer_stall_secs: 60,
+            download_timeout_secs: 1800,
+            upload_timeout_secs: 1800,
             request_timeout_secs: 90,
             poll_secs: 30,
         }
@@ -143,6 +149,8 @@ impl Config {
         );
         anyhow::ensure!(
             self.limits.claim_timeout_secs >= 10
+                && self.limits.download_timeout_secs >= 10
+                && self.limits.upload_timeout_secs >= 10
                 && self.limits.transfer_stall_secs >= 10
                 && self.limits.request_timeout_secs >= 10,
             "invalid_timeout"

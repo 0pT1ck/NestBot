@@ -8,19 +8,29 @@ static LINK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(.*?)\s*[（(]\s*(https?://[^)）]+)\s*[)）]\s*$").unwrap());
 static WAIT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s*(秒|分钟|分)").unwrap());
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize)]
 pub struct SearchPage {
+    pub keyword: String,
     pub page: Option<u32>,
+    pub total_pages: Option<u32>,
+    pub hot_searches: Vec<String>,
     pub entries: Vec<Entry>,
 }
+impl SearchPage {
+    pub fn is_result(&self) -> bool {
+        !self.entries.is_empty() || (!self.keyword.is_empty() && self.page.is_some())
+    }
+}
+static TOTAL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"共\s*(\d+)\s*页").unwrap());
 
 fn label<'a>(line: &'a str, name: &str) -> Option<&'a str> {
-    let pos = line.find(name)? + name.len();
-    let value = line[pos..].trim_start();
-    value
-        .strip_prefix(':')
-        .or_else(|| value.strip_prefix('：'))
-        .map(str::trim)
+    line.match_indices(name).find_map(|(pos, _)| {
+        let value = &line[pos + name.len()..];
+        value
+            .strip_prefix(':')
+            .or_else(|| value.strip_prefix('：'))
+            .map(str::trim)
+    })
 }
 
 pub fn line_links(text: &str, entities: &[tl::enums::MessageEntity]) -> HashMap<usize, String> {
@@ -51,11 +61,26 @@ pub fn parse_search(text: &str, links: &HashMap<usize, String>) -> SearchPage {
     let mut result = SearchPage::default();
     for (number, line) in text.lines().enumerate() {
         let line = line.trim();
+        if line.contains("搜索词")
+            && (line.contains('🔎') || (result.entries.is_empty() && result.keyword.is_empty()))
+        {
+            if let Some(keyword) = label(line, "搜索词").filter(|s| !s.is_empty()) {
+                result.keyword = keyword.into();
+            }
+            continue;
+        }
+        if line.contains("表示") && line.contains("包含") {
+            continue;
+        }
         if let Some(key) = label(line, "密钥").filter(|s| !s.is_empty()) {
             result.entries.push(Entry {
                 key: key.into(),
+                page: result.page,
                 ..Default::default()
             });
+            continue;
+        } else if line.contains("密钥") {
+            continue;
         } else if let Some(description) = label(line, "描述") {
             if let Some(entry) = result.entries.last_mut() {
                 if let Some(c) = LINK.captures(description) {
@@ -66,22 +91,45 @@ pub fn parse_search(text: &str, links: &HashMap<usize, String>) -> SearchPage {
                     entry.link = links.get(&number).cloned().unwrap_or_default();
                 }
             }
+            continue;
         } else if let Some(count) = label(line, "文件个数")
             && let Some(entry) = result.entries.last_mut()
         {
-            entry.file_count = count
+            if !count
                 .chars()
                 .filter(char::is_ascii_digit)
                 .collect::<String>()
-                .parse()
-                .ok();
+                .is_empty()
+            {
+                entry.file_count = count
+                    .chars()
+                    .filter(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse()
+                    .ok();
+            }
+            continue;
+        }
+        if let Some(items) = label(line, "热门搜索") {
+            result.hot_searches = items
+                .split(['|', '｜'])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            continue;
         }
         if let Some(c) = PAGE.captures(line) {
             result.page = c[1].parse().ok();
+            if let Some(c) = TOTAL.captures(line) {
+                result.total_pages = c[1].parse().ok();
+            }
         }
     }
     for entry in &mut result.entries {
-        entry.page = result.page;
+        if entry.page.is_none() {
+            entry.page = result.page;
+        }
     }
     result
 }
@@ -128,6 +176,25 @@ pub fn rate_wait(text: &str) -> Option<u64> {
     )
 }
 
+pub fn claim_rate_wait(text: &str) -> Option<u64> {
+    if !["暂时", "稍后", "稍候", "请重试", "频繁", "限制", "请稍"]
+        .iter()
+        .any(|s| text.contains(s))
+    {
+        return None;
+    }
+    Some(
+        WAIT.captures(text)
+            .and_then(|c| {
+                c[1].parse::<u64>()
+                    .ok()
+                    .map(|n| n.saturating_mul(if &c[2] == "秒" { 1 } else { 60 }))
+            })
+            .unwrap_or(60)
+            .clamp(1, 3600),
+    )
+}
+
 pub fn no_search_results(text: &str) -> bool {
     [
         "未找到相关结果",
@@ -168,6 +235,13 @@ pub fn search_end(text: &str) -> bool {
 }
 
 pub fn callback(message: &grammers_client::message::Message, needles: &[&str]) -> Option<Vec<u8>> {
+    callback_button(message, needles).map(|(_, data)| data)
+}
+
+pub fn callback_button(
+    message: &grammers_client::message::Message,
+    needles: &[&str],
+) -> Option<(String, Vec<u8>)> {
     if let Some(tl::enums::ReplyMarkup::ReplyInlineMarkup(markup)) = message.reply_markup() {
         for row in markup.rows {
             let tl::enums::KeyboardButtonRow::Row(row) = row;
@@ -175,7 +249,7 @@ pub fn callback(message: &grammers_client::message::Message, needles: &[&str]) -
                 if let tl::enums::KeyboardButton::Callback(button) = button
                     && needles.iter().any(|s| button.text.contains(s))
                 {
-                    return Some(button.data);
+                    return Some((button.text, button.data));
                 }
             }
         }

@@ -40,7 +40,13 @@ pub async fn execute(app: &App, action: Action) -> anyhow::Result<serde_json::Va
             serde_json::json!({"id":app.enqueue(payload,None,None).await?})
         }
         Action::Jobs { limit, offset } => {
-            serde_json::to_value(app.store.jobs(limit, offset).await?)?
+            let mut rows = vec![];
+            for job in app.store.jobs(limit, offset).await? {
+                let mut value = serde_json::to_value(&job)?;
+                value["report"] = serde_json::to_value(app.store.report(&job.id).await?)?;
+                rows.push(value);
+            }
+            serde_json::to_value(rows)?
         }
         Action::Cancel { id } => {
             app.cancel(&id).await?;

@@ -29,12 +29,22 @@ impl std::fmt::Display for RetryLater {
 }
 impl std::error::Error for RetryLater {}
 
+#[derive(Debug)]
+pub struct TelegramRejected;
+impl std::fmt::Display for TelegramRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("telegram_failed")
+    }
+}
+impl std::error::Error for TelegramRejected {}
+
 pub fn rpc(error: InvocationError) -> anyhow::Error {
     match error {
         InvocationError::Rpc(ref e) if e.code == 420 => RetryLater {
             seconds: e.value.unwrap_or(60).max(1) as u64,
         }
         .into(),
+        InvocationError::Rpc(ref e) if (400..500).contains(&e.code) => TelegramRejected.into(),
         _ => anyhow::anyhow!("telegram_failed"),
     }
 }
