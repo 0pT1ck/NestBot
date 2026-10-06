@@ -331,6 +331,7 @@ async fn once(
     target: &str,
     redo: bool,
     dry: bool,
+    batch: Option<(&str, u32)>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<ClaimStats> {
     let mut record = if redo {
@@ -554,7 +555,9 @@ async fn once(
     if !dry && (stats.files > 0 || stats.resumed > 0) {
         record.failed = stats.failed;
         record.status = if !stats.incomplete { "done" } else { "partial" }.into();
-        app.store.save_claim(payload, &record).await?;
+        app.store
+            .save_claim_for_batch(payload, &record, batch)
+            .await?;
     }
     Ok(stats)
 }
@@ -569,15 +572,21 @@ pub async fn run(
     target: &str,
     redo: bool,
     dry: bool,
+    batch: Option<(&str, u32)>,
     cancel: &CancellationToken,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     if !redo && app.store.claim_record(payload).await?.complete(expected) {
         let mut report = app.store.report(&job.summary.id).await?;
         report.skipped_keys += 1;
-        return app.store.save_report(&job.summary.id, &report).await;
+        app.store.save_report(&job.summary.id, &report).await?;
+        return Ok(true);
     }
     for round in 0..=5 {
-        match once(app, job, payload, expected, mode, target, redo, dry, cancel).await {
+        match once(
+            app, job, payload, expected, mode, target, redo, dry, batch, cancel,
+        )
+        .await
+        {
             Err(error) if error.downcast_ref::<BotRateLimit>().is_some() && round < 5 => {
                 let seconds = error
                     .downcast_ref::<BotRateLimit>()
@@ -594,7 +603,7 @@ pub async fn run(
             }
             result => {
                 let mut report = app.store.report(&job.summary.id).await?;
-                match result {
+                let completed = match result {
                     Ok(stats) => {
                         report.skipped_files += stats.skipped;
                         report.failed_files += stats.failed;
@@ -604,6 +613,7 @@ pub async fn run(
                                 report.warnings.push("claim_incomplete".into());
                             }
                         }
+                        !stats.incomplete
                     }
                     Err(error) => {
                         if cancel.is_cancelled()
@@ -618,14 +628,15 @@ pub async fn run(
                         if !report.warnings.contains(&code) {
                             report.warnings.push(code);
                         }
+                        false
                     }
-                }
+                };
                 app.store.save_report(&job.summary.id, &report).await?;
-                return Ok(());
+                return Ok(completed);
             }
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(test)]

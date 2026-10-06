@@ -50,6 +50,10 @@ CLI 搜索默认一页；Bot `/search` 默认搜全页。原 Python 业务规则
 
 支持 `/search`、`/grab`、`/fetch`、`/batch`、`/copy`、`/deep`、`/mode`、`/bind`、`/target`、`/status`、`/stop`、`/clear`、`/retry`、`/chats`、`/log`。转发媒体后自动转存，发送 `#标签` 给最近一批补标。Bot API copy 任务拥有独立执行通道，大文件 deep 任务不会阻塞它。
 
+批量转存支持批次 ID、关键词和已导入的旧 `.bin` 文件名，序号从 1 开始，起止都包含。例如 `/batch test 25 25` 只处理第 25 条。未设置目标时，先 `/bind 群ID` 或配置 `default_target`。
+
+`/batch test progress 11` 将该批次前 11 条设为已转，其余设为待转；随后 `/batch test`、`/batch continue` 或批次按钮从第 12 条开始。`progress 0` 重置为全部待转；支持调高和调低，数据在重启后保留。修改进度不发送文件、不伪造文件转存记录，也不修改其他批次；正在转存的同一批次需先停止。显式序号段仍按指定范围处理，已完成项用 `redo` 可强制重转。
+
 ## Linux 部署
 
 在开发机或 CI 构建 Linux release，不在小 VPS 上编译。CI 生成包含程序和部署文件的压缩包。详见 [部署说明](docs/deployment.md)。
@@ -75,7 +79,7 @@ systemd 默认限制 CPU 50%、内存 512MiB；Web 使用 SSH 隧道访问。数
 .\target\release\nestbot.exe --env-file config/secrets.env import-legacy legacy/python
 ```
 
-旧 `HV1` 密钥夹在用户本机解密后加密导入；旧进度因缺少目标和模式，单独保留，不能自动用于跳过。原 Telethon 会话不自动迁移，新版通过 CLI 重新登录。
+旧 `HV1` 密钥夹在用户本机解密后加密导入；已导入的旧完成记录按 Python 的领取参数参与跳过和续传。缺少旧记录时可用 `/batch 名称 progress N` 手动校准批次进度。原 Telethon 会话不自动迁移，新版通过 CLI 重新登录。
 
 ## 验证
 

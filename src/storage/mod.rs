@@ -46,6 +46,7 @@ impl Store {
         connection.execute_batch(&format!("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA cache_size=-{cache_kib}; PRAGMA temp_store=FILE; PRAGMA wal_autocheckpoint=256;"))?;
         connection.execute_batch(include_str!("../../migrations/001_initial.sql"))?;
         connection.execute_batch(include_str!("../../migrations/002_behavior.sql"))?;
+        connection.execute_batch(include_str!("../../migrations/003_batch_progress.sql"))?;
         let grouped = connection
             .prepare("PRAGMA table_info(claim_inbox)")?
             .query_map([], |r| r.get::<_, String>(1))?
@@ -316,6 +317,146 @@ impl Store {
             )?)
         })
         .await
+    }
+
+    pub async fn resolve_batch(
+        &self,
+        reference: &str,
+        legacy_password: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let keyword_id = self.vault.index("keyword", reference);
+        let alias = self.preference(&format!("batch_alias:{reference}")).await?;
+        for id in [Some(reference.to_owned()), Some(keyword_id), alias]
+            .into_iter()
+            .flatten()
+        {
+            let candidate = id.clone();
+            if self
+                .call(move |c| {
+                    Ok(
+                        c.query_row("SELECT 1 FROM batches WHERE id=?1", [candidate], |_| Ok(()))
+                            .optional()?
+                            .is_some(),
+                    )
+                })
+                .await?
+            {
+                return Ok(id);
+            }
+        }
+        // Imports made before aliases were saved can still use Python's
+        // HMAC(password, "name:" + keyword) filename without reading .bin files.
+        if reference.starts_with("k_")
+            && reference.ends_with(".bin")
+            && let Some(password) = legacy_password
+        {
+            use hmac::{Hmac, Mac};
+            use sha2::Sha256;
+            let mut offset = 0;
+            loop {
+                let batches = self.batches(100, offset).await?;
+                if batches.is_empty() {
+                    break;
+                }
+                for batch in batches {
+                    let keyword = self.batch_keyword(&batch.id).await?;
+                    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(password.as_bytes())?;
+                    mac.update(format!("name:{keyword}").as_bytes());
+                    let name = format!("k_{}.bin", &hex::encode(mac.finalize().into_bytes())[..24]);
+                    if name == reference {
+                        self.set_preference(&format!("batch_alias:{reference}"), &batch.id)
+                            .await?;
+                        return Ok(batch.id);
+                    }
+                }
+                offset += 100;
+            }
+        }
+        anyhow::bail!("batch_not_found")
+    }
+
+    pub async fn batch_override(&self, batch: &str, seq: u32) -> anyhow::Result<Option<bool>> {
+        let batch = batch.to_owned();
+        self.call(move |c| {
+            Ok(c.query_row(
+                "SELECT completed FROM batch_progress WHERE batch_id=?1 AND seq=?2",
+                params![batch, seq],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+        .await
+    }
+
+    pub async fn batch_entry_complete(
+        &self,
+        batch: &str,
+        seq: u32,
+        entry: &Entry,
+    ) -> anyhow::Result<bool> {
+        if let Some(completed) = self.batch_override(batch, seq).await? {
+            return Ok(completed);
+        }
+        Ok(self
+            .claim_record(&entry.payload())
+            .await?
+            .complete(entry.file_count))
+    }
+
+    pub async fn batch_next_pending(&self, batch: &str) -> anyhow::Result<Option<u32>> {
+        let mut offset = 1;
+        loop {
+            let entries = self.entries(batch, offset, 64).await?;
+            if entries.is_empty() {
+                return Ok(None);
+            }
+            for (seq, entry) in entries {
+                if !self.batch_entry_complete(batch, seq, &entry).await? {
+                    return Ok(Some(seq));
+                }
+                offset = seq + 1;
+            }
+        }
+    }
+
+    pub async fn set_batch_progress(&self, batch: &str, completed: u32) -> anyhow::Result<()> {
+        let batch = batch.to_owned();
+        let vault = self.vault.clone();
+        self.call(move |c| {
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let count:u32=tx.query_row("SELECT count(*) FROM entries WHERE batch_id=?1",[&batch],|r|r.get(0))?;
+            anyhow::ensure!(count>0,"batch_not_found");
+            anyhow::ensure!(completed<=count,"invalid_batch_progress");
+            {
+                let mut stmt=tx.prepare("SELECT id,payload FROM jobs WHERE kind='transfer' AND status IN ('running','cancelling')")?;
+                for row in stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Vec<u8>>(1)?)))? {
+                    let (id,body)=row?;
+                    let payload:JobPayload=serde_json::from_slice(&vault.decrypt(&format!("job:{id}"),&body)?)?;
+                    anyhow::ensure!(!matches!(payload,JobPayload::Transfer {batch:Some(ref current),..} if current==&batch),"batch_busy");
+                }
+            }
+            tx.execute("DELETE FROM batch_progress WHERE batch_id=?1",[&batch])?;
+            tx.execute("INSERT INTO batch_progress(batch_id,seq,completed) SELECT batch_id,seq,CASE WHEN seq<=?2 THEN 1 ELSE 0 END FROM entries WHERE batch_id=?1",params![batch,completed])?;
+            tx.commit()?;
+            Ok(())
+        }).await
+    }
+
+    pub async fn finish_batch_entry(
+        &self,
+        batch: &str,
+        seq: u32,
+        completed: bool,
+    ) -> anyhow::Result<()> {
+        let batch = batch.to_owned();
+        self.call(move |c| {
+            if completed {
+                c.execute("DELETE FROM batch_progress WHERE batch_id=?1 AND seq=?2",params![batch,seq])?;
+            } else {
+                c.execute("INSERT INTO batch_progress VALUES(?1,?2,0) ON CONFLICT(batch_id,seq) DO UPDATE SET completed=0",params![batch,seq])?;
+            }
+            Ok(())
+        }).await
     }
 
     pub async fn cursor(&self, keyword: &str) -> anyhow::Result<Option<(u32, Option<i32>)>> {
@@ -596,15 +737,35 @@ impl Store {
     }
 
     pub async fn save_claim(&self, payload: &str, record: &ClaimRecord) -> anyhow::Result<()> {
+        self.save_claim_for_batch(payload, record, None).await
+    }
+
+    pub async fn save_claim_for_batch(
+        &self,
+        payload: &str,
+        record: &ClaimRecord,
+        batch: Option<(&str, u32)>,
+    ) -> anyhow::Result<()> {
         let id = self.vault.index("claim", payload);
         let body = self
             .vault
             .encrypt(&format!("claim:{id}"), &serde_json::to_vec(record)?)?;
+        let batch = batch
+            .filter(|_| record.status == "done")
+            .map(|(batch, seq)| (batch.to_owned(), seq));
         self.call(move |c| {
-            c.execute(
+            let tx = c.transaction()?;
+            tx.execute(
                 "INSERT INTO claims VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body",
                 params![id, body],
             )?;
+            if let Some((batch, seq)) = batch {
+                tx.execute(
+                    "DELETE FROM batch_progress WHERE batch_id=?1 AND seq=?2",
+                    params![batch, seq],
+                )?;
+            }
+            tx.commit()?;
             Ok(())
         })
         .await

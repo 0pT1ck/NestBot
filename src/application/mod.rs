@@ -209,22 +209,45 @@ impl App {
                             if end.is_some_and(|end| seq > end) {
                                 return Ok(());
                             }
-                            claim::run(
+                            if !redo && self.store.batch_entry_complete(batch, seq, &entry).await? {
+                                let mut report = self.store.report(&job.summary.id).await?;
+                                report.skipped_keys += 1;
+                                self.store.save_report(&job.summary.id, &report).await?;
+                                processed += 1;
+                                offset = seq + 1;
+                                continue;
+                            }
+                            let payload = if options.use_key {
+                                entry.key.trim().into()
+                            } else {
+                                entry.payload()
+                            };
+                            let entry_redo = *redo
+                                || (self.store.batch_override(batch, seq).await? == Some(false)
+                                    && self
+                                        .store
+                                        .claim_record(&payload)
+                                        .await?
+                                        .complete(entry.file_count));
+                            if !dry_run && *redo {
+                                self.store.finish_batch_entry(batch, seq, false).await?;
+                            }
+                            let completed = claim::run(
                                 self,
                                 job,
-                                &if options.use_key {
-                                    entry.key.trim().into()
-                                } else {
-                                    entry.payload()
-                                },
+                                &payload,
                                 entry.file_count,
                                 mode,
                                 target,
-                                *redo,
+                                entry_redo,
                                 *dry_run,
+                                Some((batch.as_str(), seq)),
                                 cancel,
                             )
                             .await?;
+                            if !dry_run {
+                                self.store.finish_batch_entry(batch, seq, completed).await?;
+                            }
                             processed += 1;
                             offset = seq + 1;
                         }
@@ -237,8 +260,10 @@ impl App {
                         if key.is_empty() || !seen.insert(key) {
                             continue;
                         }
-                        claim::run(self, job, key, None, mode, target, *redo, *dry_run, cancel)
-                            .await?;
+                        claim::run(
+                            self, job, key, None, mode, target, *redo, *dry_run, None, cancel,
+                        )
+                        .await?;
                     }
                     Ok(())
                 }

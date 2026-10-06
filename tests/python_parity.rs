@@ -395,10 +395,21 @@ async fn bot_flags_search_limits_and_batch_continue_use_python_rules() {
         .finish(&job.summary.id, "completed", None, None)
         .await
         .unwrap();
-    store
-        .set_preference("last_batch", "synthetic-batch")
+    let batch = store
+        .save_page(
+            "synthetic-batch",
+            1,
+            None,
+            (1..=30)
+                .map(|n| Entry {
+                    key: format!("synthetic-batch-{n}"),
+                    ..Default::default()
+                })
+                .collect(),
+        )
         .await
         .unwrap();
+    store.set_preference("last_batch", &batch).await.unwrap();
     store
         .set_preference("last_batch_start", "25")
         .await

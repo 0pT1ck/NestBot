@@ -138,6 +138,131 @@ pub async fn search_result(
     Ok(())
 }
 
+async fn batch_command(
+    app: &App,
+    owner: i64,
+    args: &[&str],
+    update: Option<i32>,
+) -> anyhow::Result<String> {
+    let reference = args[0];
+    let continuing = reference.eq_ignore_ascii_case("continue");
+    let password = crate::config::Config::env_secret("LEGACY_VAULT_PASSWORD")
+        .or_else(|| crate::config::Config::env_secret(&app.config.web.vault_password_env));
+    let batch = if continuing {
+        app.store
+            .preference("last_batch")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no_previous_batch"))?
+    } else {
+        match app.store.resolve_batch(reference,password.as_ref().map(|s|s.as_str())).await {
+            Ok(batch)=>batch,
+            Err(error) if error.to_string()=="batch_not_found" => return Ok("找不到该密钥夹；发送 /batch 查看名称和批次 ID。旧 .bin 文件名需已导入，或使用对应旧密码。".into()),
+            Err(error)=>return Err(error),
+        }
+    };
+    if args
+        .get(1)
+        .is_some_and(|s| ["progress", "set", "进度", "已转"].contains(s))
+    {
+        let Some(completed) = args
+            .get(2)
+            .filter(|_| args.len() == 3)
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            return Ok(
+                "用法：/batch 名称 progress 已转条数，例如 /batch test progress 11；0 表示重置。"
+                    .into(),
+            );
+        };
+        match app.store.set_batch_progress(&batch, completed).await {
+            Ok(()) => {}
+            Err(error) if error.to_string() == "invalid_batch_progress" => {
+                return Ok("已转条数不能超过该密钥夹的总条数。".into());
+            }
+            Err(error) if error.to_string() == "batch_busy" => {
+                return Ok("该批次正在转存，请先 /stop，等待任务停止后再修改进度。".into());
+            }
+            Err(error) => return Err(error),
+        }
+        app.store.set_preference("last_batch", &batch).await?;
+        app.store
+            .set_preference("last_batch_start", &(completed + 1).to_string())
+            .await?;
+        let keyword = app.store.batch_keyword(&batch).await?;
+        let next = app.store.batch_next_pending(&batch).await?;
+        return Ok(format!(
+            "{keyword}：已转条数设为 {completed}。前 {completed} 条视为已转，其余重设为未转。{}",
+            next.map(|n| format!("下次从第 {n} 条开始。"))
+                .unwrap_or_else(|| "该密钥夹已全部完成。".into())
+        ));
+    }
+    let numbers = args[1..]
+        .iter()
+        .filter_map(|s| s.parse::<u32>().ok())
+        .collect::<Vec<_>>();
+    let redo = args[1..].contains(&"redo");
+    let start = if let Some(start) = numbers.first() {
+        *start
+    } else if redo {
+        1
+    } else if continuing {
+        app.store
+            .preference("last_batch_start")
+            .await?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1)
+    } else if let Some(next) = app.store.batch_next_pending(&batch).await? {
+        next
+    } else {
+        return Ok("该密钥夹已全部转存；加 redo 可强制重转，或用 progress 修改已转条数。".into());
+    };
+    let end = if continuing {
+        None
+    } else {
+        numbers.get(1).copied()
+    };
+    if start == 0
+        || end.is_some_and(|n| n < start)
+        || app.store.entries(&batch, start, 1).await?.is_empty()
+    {
+        return Ok("序号范围无效；起止序号从 1 开始，且起始序号不能超过总条数。".into());
+    }
+    let target = app.target().await?;
+    if target.trim().is_empty() {
+        return Ok("尚未设置转存目标。请先 /bind 群ID，或填写 config/nestbot.toml 的 default_target，再重启服务。".into());
+    }
+    let options = crate::domain::TransferOptions {
+        confirmed: continuing,
+        ..Default::default()
+    };
+    let id = app
+        .enqueue(
+            JobPayload::Transfer {
+                options,
+                keys: vec![],
+                batch: Some(batch.clone()),
+                start,
+                end,
+                mode: app.mode().await?,
+                target,
+                redo,
+                dry_run: args[1..].contains(&"--dry"),
+            },
+            Some(owner),
+            update,
+        )
+        .await?;
+    app.store.set_preference("last_batch", &batch).await?;
+    app.store
+        .set_preference("last_batch_start", &start.to_string())
+        .await?;
+    Ok(format!(
+        "批量转存已排队：{id}\n范围：第 {start} 条到{}。",
+        end.map(|n| format!("第 {n} 条"))
+            .unwrap_or_else(|| "末条".into())
+    ))
+}
+
 async fn batch_list(app: &App, owner: i64) -> anyhow::Result<String> {
     let mut lines = vec![];
     let mut rows = vec![];
@@ -145,6 +270,7 @@ async fn batch_list(app: &App, owner: i64) -> anyhow::Result<String> {
         let keyword = app.store.batch_keyword(&batch.id).await?;
         let mut offset = 1;
         let mut done = 0;
+        let mut next = None;
         loop {
             let entries = app.store.entries(&batch.id, offset, 64).await?;
             if entries.is_empty() {
@@ -153,11 +279,12 @@ async fn batch_list(app: &App, owner: i64) -> anyhow::Result<String> {
             for (seq, entry) in entries {
                 if app
                     .store
-                    .claim_record(&entry.payload())
+                    .batch_entry_complete(&batch.id, seq, &entry)
                     .await?
-                    .complete(entry.file_count)
                 {
                     done += 1;
+                } else if next.is_none() {
+                    next = Some(seq);
                 }
                 offset = seq + 1;
             }
@@ -171,7 +298,7 @@ async fn batch_list(app: &App, owner: i64) -> anyhow::Result<String> {
             options: Default::default(),
             keys: vec![],
             batch: Some(batch.id),
-            start: 1,
+            start: next.unwrap_or(1),
             end: None,
             mode: app.mode().await?,
             target: app.target().await?,
@@ -216,12 +343,7 @@ pub async fn batch_confirmation(
             if end.is_some_and(|n| seq > n) {
                 break;
             }
-            if app
-                .store
-                .claim_record(&entry.payload())
-                .await?
-                .complete(entry.file_count)
-            {
+            if app.store.batch_entry_complete(batch, seq, &entry).await? {
                 done += 1;
             } else {
                 pending += 1;
@@ -627,7 +749,7 @@ pub async fn command(
     }
     let command = words[0].split('@').next().unwrap_or(words[0]);
     match command {
-        "/start"|"/help"=>Ok("归巢 Rust\n转发媒体自动转存；#标签 补标\n/search 关键词 [页数|continue]\n/grab 密钥…：copy\n/fetch 密钥…：deep\n/batch：批次列表\n/batch ID [起] [止] [redo]\n/copy /deep /mode\n/bind 群ID；/target\n/status /stop [任务ID] /clear\n/retry 任务ID\n/chats：账号群组\n/log：最近运行事件\nWeb 管理通过本机 8787 端口访问。".into()),
+        "/start"|"/help"=>Ok("归巢 Rust\n转发媒体自动转存；#标签 补标\n/search 关键词 [页数|continue]\n/grab 密钥…：copy\n/fetch 密钥…：deep\n/batch：批次列表\n/batch 名称或ID [起] [止] [redo]\n/batch 名称 progress 已转条数\n/copy /deep /mode\n/bind 群ID；/target\n/status /stop [任务ID] /clear\n/retry 任务ID\n/chats：账号群组\n/log：最近运行事件\nWeb 管理通过本机 8787 端口访问。".into()),
         "/copy"|"/deep"=>{let mode=&command[1..];app.store.set_preference("mode",mode).await?;Ok(format!("已切换为 {mode}。"))},
         "/mode"=>Ok(format!("当前模式：{}",app.mode().await?.as_str())),
         "/target"=>Ok(format!("目标：{}",app.target().await?)),
@@ -669,21 +791,7 @@ pub async fn command(
             Ok(if id.is_empty(){"任务已接收。".into()}else{format!("搜索已排队：{id}")})
         },
         "/batch"|"/grab"|"/fetch" if words.len()==1=>batch_list(app,chat).await,
-        "/batch"=>{
-            let id=words[1];
-            let numbers=words[2..].iter().filter_map(|s|s.parse::<u32>().ok()).collect::<Vec<_>>();
-            let (batch,start)=if id.eq_ignore_ascii_case("continue") {
-                let batch=app.store.preference("last_batch").await?.ok_or_else(||anyhow::anyhow!("no_previous_batch"))?;
-                let previous=app.store.preference("last_batch_start").await?.and_then(|s|s.parse().ok()).unwrap_or(1);
-                (batch,words.get(2).and_then(|s|s.parse().ok()).unwrap_or(previous))
-            }else{(id.into(),numbers.first().copied().unwrap_or(1))};
-            let end=if id.eq_ignore_ascii_case("continue") {None} else {numbers.get(1).copied()};
-            let target=app.target().await?;anyhow::ensure!(!target.is_empty(),"missing_target");
-            let batch=app.store.preference(&format!("batch_alias:{batch}")).await?.unwrap_or(batch);
-            let options=crate::domain::TransferOptions { confirmed:id.eq_ignore_ascii_case("continue"), ..Default::default() };
-            let id=app.enqueue(JobPayload::Transfer{options,keys:vec![],batch:Some(batch.clone()),start:start.max(1),end:end.filter(|n|*n>0),mode:app.mode().await?,target,redo:words.contains(&"redo"),dry_run:words.contains(&"--dry")},Some(chat),update).await?;
-            app.store.set_preference("last_batch",&batch).await?;app.store.set_preference("last_batch_start",&start.to_string()).await?;Ok(format!("批量转存已排队：{id}"))
-        },
+        "/batch"=>batch_command(app,chat,&words[1..],update).await,
         "/grab"|"/fetch"=>{
             let (keys,redo,dry_run)=commands::fetch_args(&words[1..].join(" "));
             if keys.is_empty() {return batch_list(app,chat).await;}
