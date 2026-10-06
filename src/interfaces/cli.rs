@@ -344,7 +344,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         crate::application::migration::import_legacy(&store, &path, &password)
                             .await?;
                     println!(
-                        "导入完成：{batches} 个批次，读取 {entries} 条。旧转存进度单独保留，未自动映射目标/模式；账号请重新登录。"
+                        "导入完成：{batches} 个批次，读取 {entries} 条。旧完成记录已保留并用于跳过及续传；账号请重新登录。"
                     );
                     Ok(())
                 }

@@ -417,3 +417,28 @@ async fn bot_flags_search_limits_and_batch_continue_use_python_rules() {
         panic!("expected transfer");
     }
 }
+
+#[tokio::test]
+async fn idle_stop_is_harmless_and_status_reports_the_queue_mode_and_target() {
+    let (_dir, store) = fixture();
+    let app = App::new(
+        Config {
+            default_target: "-100123456789".into(),
+            ..Default::default()
+        },
+        store,
+    )
+    .unwrap();
+    assert!(
+        nestbot::interfaces::bot::command(&app, 42, "/stop", None)
+            .await
+            .is_ok()
+    );
+    let text = nestbot::interfaces::bot::command(&app, 42, "/status", None)
+        .await
+        .unwrap();
+    assert!(text.contains("空闲"));
+    assert!(text.contains("0 个等待"));
+    assert!(text.contains("copy"));
+    assert!(text.contains("-100123456789"));
+}

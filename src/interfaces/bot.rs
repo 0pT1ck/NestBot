@@ -646,10 +646,18 @@ pub async fn command(
             if let Some(bot)=&app.bot && bot.get_chat(recipient(target)).await.is_err() {note.push_str("Bot 暂时无法访问该目标；copy 媒体需将 Bot 加入频道并授予发消息权限。");}
             Ok(note)
         },
-        "/status"=>{let jobs=app.store.jobs(10,0).await?;Ok(jobs.iter().map(|j|format!("{} {} {} {}",j.id,j.kind,j.status,j.completed)).collect::<Vec<_>>().join("\n"))},
+        "/status"=>{
+            let (current,queued)=app.store.call(|c| {
+                let mut statement=c.prepare("SELECT id,kind,phase,completed,total FROM jobs WHERE status IN ('running','cancelling') AND kind!='incoming_copy' ORDER BY rowid")?;
+                let current=statement.query_map([],|r|Ok(format!("{} {} {} {}/{}",r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,u64>(3)?,r.get::<_,Option<u64>>(4)?.map(|n|n.to_string()).unwrap_or_else(||"?".into()))))?.collect::<Result<Vec<_>,_>>()?;
+                let queued=c.query_row("SELECT count(*) FROM jobs WHERE status IN ('queued','waiting','interrupted') AND kind!='incoming_copy'",[],|r|r.get::<_,u32>(0))?;
+                Ok((current,queued))
+            }).await?;
+            Ok(format!("任务：{}\n队列：{queued} 个等待\n处理方式：{}\n目标：{}",if current.is_empty(){"空闲".into()}else{current.join("\n")},app.mode().await?.as_str(),app.target().await?))
+        },
         "/stop"=>{
-            let active=app.store.jobs(100,0).await?.into_iter().find(|j|j.status=="running" && j.kind!="incoming_copy").map(|j|j.id);
-            let id=words.get(1).map(|s|s.to_string()).or(active).ok_or_else(||anyhow::anyhow!("no_active_job"))?;
+            let active=app.store.call(|c| {use rusqlite::OptionalExtension;Ok(c.query_row("SELECT id FROM jobs WHERE status='running' AND kind!='incoming_copy' ORDER BY rowid LIMIT 1",[],|r|r.get::<_,String>(0)).optional()?)}).await?;
+            let Some(id)=words.get(1).map(|s|s.to_string()).or(active) else {return Ok("停止信号已发出，当前没有正在运行的协议任务。".into());};
             app.cancel(&id).await?;Ok("停止请求已提交，已完成记录保留。".into())
         },
         "/clear"=>Ok(format!("已清空 {} 个排队任务。",app.store.clear_queue().await?)),
