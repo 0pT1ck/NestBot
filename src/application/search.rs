@@ -274,10 +274,7 @@ pub async fn run(
             .await?
             .ok_or_else(|| anyhow::anyhow!("search_no_results"))?,
         );
-        if reply
-            .as_ref()
-            .is_some_and(|m| !parse(m).is_result() && !parser::no_search_results(m.text()))
-        {
+        if reply.as_ref().is_some_and(|m| !parse(m).is_result()) {
             bounded(cancel, timeout, async {
                 account
                     .client
