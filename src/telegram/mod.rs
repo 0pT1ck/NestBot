@@ -244,8 +244,9 @@ impl Account {
         peer: PeerRef,
         message: &Message,
         data: Vec<u8>,
-    ) -> anyhow::Result<()> {
-        self.client
+    ) -> anyhow::Result<Option<String>> {
+        let answer = self
+            .client
             .invoke(
                 &grammers_tl_types::functions::messages::GetBotCallbackAnswer {
                     game: false,
@@ -255,9 +256,18 @@ impl Account {
                     password: None,
                 },
             )
-            .await
-            .map_err(rpc)?;
-        Ok(())
+            .await;
+        // Some bots edit the result but never acknowledge the callback. The
+        // caller must still read the resulting message before deciding it failed.
+        let answer = match answer {
+            Ok(answer) => answer,
+            Err(InvocationError::Rpc(ref error)) if error.name == "BOT_RESPONSE_TIMEOUT" => {
+                return Ok(None);
+            }
+            Err(error) => return Err(rpc(error)),
+        };
+        let grammers_tl_types::enums::messages::BotCallbackAnswer::Answer(answer) = answer;
+        Ok(answer.message)
     }
 }
 

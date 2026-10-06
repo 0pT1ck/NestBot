@@ -25,6 +25,7 @@ pub fn safe_error(error: &anyhow::Error) -> &'static str {
         "telegram_timeout" => "telegram_timeout",
         "telegram_retries_exhausted" => "telegram_retries_exhausted",
         "search_no_results" => "search_no_results",
+        "search_partial_timeout" => "search_partial_timeout",
         "invalid_config" => "invalid_config",
         "service_already_running" => "service_already_running",
         "vault_password_required" => "vault_password_required",

@@ -41,7 +41,14 @@ impl PageHistory for Account {
     }
 }
 
-fn page_ready(message: &Message, previous: Option<&Message>) -> anyhow::Result<bool> {
+#[derive(Debug, PartialEq, Eq)]
+enum PageState {
+    Pending,
+    Ready,
+    End,
+}
+
+fn page_ready(message: &Message, previous: Option<&Message>) -> anyhow::Result<PageState> {
     let page = parser::parse_search(
         message.text(),
         &parser::line_links(
@@ -50,9 +57,27 @@ fn page_ready(message: &Message, previous: Option<&Message>) -> anyhow::Result<b
         ),
     );
     if !page.entries.is_empty() {
-        return Ok(previous.is_none_or(|p| {
-            p.text() != message.text() || p.fmt_entities() != message.fmt_entities()
-        }));
+        if let Some(p) = previous {
+            let same_content =
+                p.text() == message.text() && p.fmt_entities() == message.fmt_entities();
+            // Navigation can disappear without changing the final page's text.
+            if same_content
+                && parser::callback(p, &["下一页"]).is_some()
+                && parser::callback(message, &["下一页"]).is_none()
+            {
+                return Ok(PageState::End);
+            }
+            if p.id() == message.id() && same_content && p.reply_markup() == message.reply_markup()
+            {
+                return Ok(PageState::Pending);
+            }
+        }
+        return Ok(PageState::Ready);
+    }
+    if previous.is_some()
+        && (parser::search_end(message.text()) || parser::no_search_results(message.text()))
+    {
+        return Ok(PageState::End);
     }
     anyhow::ensure!(
         !parser::no_search_results(message.text()),
@@ -61,7 +86,7 @@ fn page_ready(message: &Message, previous: Option<&Message>) -> anyhow::Result<b
     if let Some(seconds) = parser::rate_wait(message.text()) {
         return Err(RetryLater { seconds }.into());
     }
-    Ok(false)
+    Ok(PageState::Pending)
 }
 
 async fn wait_page(
@@ -72,7 +97,7 @@ async fn wait_page(
     previous: Option<&Message>,
     timeout: u64,
     cancel: &CancellationToken,
-) -> anyhow::Result<Message> {
+) -> anyhow::Result<Option<Message>> {
     let deadline = Instant::now() + Duration::from_secs(timeout);
     let mut next_poll = Instant::now();
     let mut updates_open = true;
@@ -86,7 +111,11 @@ async fn wait_page(
             })=>{
                 match result {
                     Ok(Ok(message)) if message.peer_id()==peer.id && !message.outgoing() && (message.id()>after || previous.is_some_and(|p|p.id()==message.id()))=>{
-                        if page_ready(&message, previous)? {return Ok(message);}
+                        match page_ready(&message, previous)? {
+                            PageState::Ready => return Ok(Some(message)),
+                            PageState::End => return Ok(None),
+                            PageState::Pending => {},
+                        }
                     }
                     Ok(Err(broadcast::error::RecvError::Closed)) => updates_open=false,
                     _=>{}
@@ -97,7 +126,11 @@ async fn wait_page(
                 // including the initial response and edits to processing placeholders.
                 let messages = bounded(cancel,remaining.as_secs().max(1).min(timeout),account.poll(peer, after, previous.map(Message::id))).await?;
                 for message in messages {
-                    if page_ready(&message, previous)? {return Ok(message);}
+                    match page_ready(&message, previous)? {
+                        PageState::Ready => return Ok(Some(message)),
+                        PageState::End => return Ok(None),
+                        PageState::Pending => {},
+                    }
                 }
             }
         }
@@ -161,7 +194,8 @@ pub async fn run(
                 timeout,
                 cancel,
             )
-            .await?,
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("search_no_results"))?,
         );
     }
     let mut reply = reply.unwrap();
@@ -182,7 +216,8 @@ pub async fn run(
                 timeout,
                 cancel,
             )
-            .await?;
+            .await?
+            .unwrap_or(reply);
         }
     }
     let minimum = cursor.map(|(page, _)| page + 1).unwrap_or(1);
@@ -225,8 +260,16 @@ pub async fn run(
             Ok(())
         })
         .await?;
-        bounded(cancel, timeout, account.click(peer, &reply, data)).await?;
-        reply = wait_page(
+        let answer = bounded(cancel, timeout, account.click(peer, &reply, data))
+            .await
+            .map_err(|error| partial_timeout(error, collected))?;
+        if answer.as_deref().is_some_and(parser::search_end) {
+            break;
+        }
+        if let Some(seconds) = answer.as_deref().and_then(parser::rate_wait) {
+            return Err(RetryLater { seconds }.into());
+        }
+        let next = wait_page(
             account.as_ref(),
             &mut receiver,
             peer,
@@ -235,9 +278,22 @@ pub async fn run(
             timeout,
             cancel,
         )
-        .await?;
+        .await
+        .map_err(|error| partial_timeout(error, collected))?;
+        let Some(next) = next else {
+            break;
+        };
+        reply = next;
     }
     Ok(())
+}
+
+fn partial_timeout(error: anyhow::Error, collected: u32) -> anyhow::Error {
+    if error.to_string() == "telegram_timeout" && collected > 0 {
+        anyhow::anyhow!("search_partial_timeout")
+    } else {
+        error
+    }
 }
 
 #[cfg(test)]
@@ -283,6 +339,110 @@ mod tests {
         }
     }
 
+    fn next_button(message: &mut Message) {
+        use grammers_tl_types::{enums, types};
+        let enums::Message::Message(raw) = &mut message.raw else {
+            panic!("expected message")
+        };
+        raw.reply_markup = Some(
+            types::ReplyInlineMarkup {
+                rows: vec![
+                    types::KeyboardButtonRow {
+                        buttons: vec![
+                            types::KeyboardButtonCallback {
+                                requires_password: false,
+                                style: None,
+                                text: "下一页 ➡️".into(),
+                                data: b"next".to_vec(),
+                            }
+                            .into(),
+                        ],
+                    }
+                    .into(),
+                ],
+            }
+            .into(),
+        );
+    }
+
+    #[tokio::test]
+    async fn final_page_button_removal_is_detected_without_text_change() {
+        let mut old = message("密钥：synthetic-last\n第 2 页");
+        let final_page = old.clone();
+        next_button(&mut old);
+        let peer = old.peer_ref().await.unwrap().unwrap();
+        let (tx, mut rx) = broadcast::channel(4);
+        drop(tx);
+        let received = wait_page(
+            &History(Mutex::new(vec![final_page])),
+            &mut rx,
+            peer,
+            old.id(),
+            Some(&old),
+            1,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(received.is_none());
+    }
+
+    #[tokio::test]
+    async fn separate_end_notice_finishes_pagination() {
+        let old = message("密钥：synthetic-last\n第 2 页");
+        let peer = old.peer_ref().await.unwrap().unwrap();
+        let (tx, mut rx) = broadcast::channel(4);
+        drop(tx);
+        let received = wait_page(
+            &History(Mutex::new(vec![message("已经是最后一页，没有更多结果")])),
+            &mut rx,
+            peer,
+            old.id(),
+            Some(&old),
+            1,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(received.is_none());
+        assert!(parser::search_end("已是最后一页"));
+        assert!(!parser::search_end("第 2 页 / 共 2 页"));
+        assert!(!parser::search_end("正在加载下一页，请稍候"));
+    }
+
+    #[test]
+    fn identical_content_in_a_new_message_is_a_response_but_stale_history_is_not() {
+        let old = message("密钥：synthetic-key");
+        assert_eq!(page_ready(&old, Some(&old)).unwrap(), PageState::Pending);
+        let mut new = old.clone();
+        let grammers_tl_types::enums::Message::Message(raw) = &mut new.raw else {
+            panic!("expected message")
+        };
+        raw.id += 1;
+        assert_eq!(page_ready(&new, Some(&old)).unwrap(), PageState::Ready);
+    }
+
+    #[tokio::test]
+    async fn unchanged_next_page_remains_a_timeout_instead_of_false_success() {
+        let mut old = message("密钥：synthetic-key\n第 2 页 / 共 2 页");
+        next_button(&mut old);
+        let peer = old.peer_ref().await.unwrap().unwrap();
+        let (tx, mut rx) = broadcast::channel(4);
+        drop(tx);
+        let error = wait_page(
+            &History(Mutex::new(vec![old.clone()])),
+            &mut rx,
+            peer,
+            old.id(),
+            Some(&old),
+            1,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "telegram_timeout");
+    }
+
     #[tokio::test]
     async fn processing_placeholder_does_not_resend_before_result_arrives() {
         let placeholder = message("正在搜索，请稍候……");
@@ -301,6 +461,7 @@ mod tests {
             &CancellationToken::new(),
         )
         .await
+        .unwrap()
         .unwrap();
         assert!(received.text().contains("synthetic-key"));
     }
@@ -322,6 +483,7 @@ mod tests {
             &CancellationToken::new(),
         )
         .await
+        .unwrap()
         .unwrap();
         assert!(received.text().contains("synthetic-new"));
     }

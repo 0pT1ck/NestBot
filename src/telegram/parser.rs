@@ -141,6 +141,32 @@ pub fn no_search_results(text: &str) -> bool {
     .any(|s| text.contains(s))
 }
 
+pub fn search_end(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    [
+        "已是最后一页",
+        "已经是最后一页",
+        "已经到最后一页",
+        "已到最后一页",
+        "已到达最后一页",
+        "已经到达最后一页",
+        "当前是最后一页",
+        "最后一页了",
+        "最后一页啦",
+        "已经是末页",
+        "已是末页",
+        "没有下一页",
+        "没有更多结果",
+        "没有更多搜索结果",
+        "暂无更多结果",
+        "没有更多了",
+        "no more results",
+        "already on the last page",
+    ]
+    .iter()
+    .any(|s| lower.contains(s))
+}
+
 pub fn callback(message: &grammers_client::message::Message, needles: &[&str]) -> Option<Vec<u8>> {
     if let Some(tl::enums::ReplyMarkup::ReplyInlineMarkup(markup)) = message.reply_markup() {
         for row in markup.rows {

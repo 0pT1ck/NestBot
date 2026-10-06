@@ -60,14 +60,37 @@ pub async fn worker(app: Arc<App>, fast: bool) -> anyhow::Result<()> {
             tracing::info!(event="job_finished",job_id=%job.summary.id,status,error_code=error);
             if let (Some(bot), Some(chat)) = (&app.bot, job.reply_chat) {
                 use teloxide::prelude::*;
+                let progress = if job.summary.kind == "search" {
+                    let saved = app
+                        .store
+                        .job(&job.summary.id)
+                        .await?
+                        .map(|j| j.completed)
+                        .unwrap_or(0);
+                    if saved > 0 {
+                        format!(
+                            "\n已保存 {saved} 页搜索结果。{}",
+                            if error == Some("search_partial_timeout") {
+                                "翻页未确认完成，可用 /search 关键词 continue 继续。"
+                            } else {
+                                ""
+                            }
+                        )
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
                 let _ = bot
                     .send_message(
                         ChatId(chat),
                         format!(
-                            "任务 {}：{}{}",
+                            "任务 {}：{}{}{}",
                             job.summary.id,
                             status,
-                            error.map(|e| format!("（{e}）")).unwrap_or_default()
+                            error.map(|e| format!("（{e}）")).unwrap_or_default(),
+                            progress
                         ),
                     )
                     .await;
