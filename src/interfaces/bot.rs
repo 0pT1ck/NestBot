@@ -74,7 +74,7 @@ pub async fn search_result(
     let mut lines = vec![format!(
         "🔎 关键词：{display_keyword}，本次收集 {count} 条\n数据库批次：{batch}"
     )];
-    let mut rows = vec![];
+    let mut buttons = vec![];
     for (index, (seq, entry)) in entries.iter().enumerate() {
         let description = if app.config.telegram.mask_output {
             "text"
@@ -105,11 +105,12 @@ pub async fn search_result(
             .store
             .callback(owner, &serde_json::json!({"payload":payload}))
             .await?;
-        rows.push(vec![teloxide::types::InlineKeyboardButton::callback(
+        buttons.push(teloxide::types::InlineKeyboardButton::callback(
             format!("⬆ {}", index + 1),
             data,
-        )]);
+        ));
     }
+    let mut rows = buttons.chunks(5).map(<[_]>::to_vec).collect::<Vec<_>>();
     let options = crate::domain::TransferOptions {
         selection: Some(job.summary.id.clone()),
         ..Default::default()
