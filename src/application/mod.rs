@@ -1,5 +1,6 @@
 pub mod claim;
 pub mod migration;
+mod progress;
 pub mod search;
 
 use crate::{config::Config, domain::*, storage::Store, telegram::Users};
@@ -118,6 +119,12 @@ impl App {
     }
 
     pub async fn execute(&self, job: &Job, cancel: &CancellationToken) -> anyhow::Result<()> {
+        // Keep the large transfer future off the caller's stack while the
+        // progress observer holds it across long waits (including on Windows).
+        progress::observe(self, job, cancel, Box::pin(self.execute_inner(job, cancel))).await
+    }
+
+    async fn execute_inner(&self, job: &Job, cancel: &CancellationToken) -> anyhow::Result<()> {
         match &job.payload {
             JobPayload::Search {
                 keyword,
@@ -136,6 +143,9 @@ impl App {
                 dry_run,
                 options,
             } => {
+                let mut report = self.store.report(&job.summary.id).await?;
+                report.transfer_key = None;
+                self.store.save_report(&job.summary.id, &report).await?;
                 let mut options = options.clone();
                 let current_target = if job.reply_chat.is_some() {
                     Some(self.target().await?)
@@ -222,6 +232,7 @@ impl App {
                             } else {
                                 entry.payload()
                             };
+                            self.transfer_key(job, seq).await?;
                             let entry_redo = *redo
                                 || (self.store.batch_override(batch, seq).await? == Some(false)
                                     && self
@@ -255,11 +266,14 @@ impl App {
                     Ok(())
                 } else {
                     let mut seen = std::collections::HashSet::new();
+                    let mut sequence = 0;
                     for key in keys {
                         let key = key.trim();
                         if key.is_empty() || !seen.insert(key) {
                             continue;
                         }
+                        sequence += 1;
+                        self.transfer_key(job, sequence).await?;
                         claim::run(
                             self, job, key, None, mode, target, *redo, *dry_run, None, cancel,
                         )
@@ -295,5 +309,13 @@ impl App {
                 .await
             }
         }
+    }
+
+    async fn transfer_key(&self, job: &Job, sequence: u32) -> anyhow::Result<()> {
+        let mut report = self.store.report(&job.summary.id).await?;
+        report.transfer_key = Some(sequence);
+        self.store.save_report(&job.summary.id, &report).await?;
+        self.progress(&job.summary.id, "claim_waiting", 0, None)
+            .await
     }
 }

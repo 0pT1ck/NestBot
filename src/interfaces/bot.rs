@@ -23,6 +23,12 @@ pub async fn send(app: &App, chat: i64, text: &str) {
     if text.is_empty() {
         return;
     }
+    if let Some(id) = super::progress::receipt_job(text) {
+        if super::progress::receipt(app, chat, text, id).await.is_err() {
+            tracing::warn!(event = "bot_receipt_failed");
+        }
+        return;
+    }
     if let Some(bot) = &app.bot {
         let truncated = text.chars().take(3800).collect::<String>();
         let _ = bot.send_message(ChatId(chat), truncated).await;
@@ -779,6 +785,9 @@ pub async fn command(
             let mut lines=Vec::with_capacity(current.len());
             for (id,mut line) in current {
                 let report=app.store.report(&id).await?;
+                if let Some(page)=report.search_page {line.push_str(&format!("\n当前搜索：第 {page} 页"));}
+                if let Some(key)=report.transfer_key {line.push_str(&format!("\n正在转存第 {key} 个密钥"));}
+                if let Some(wait)=super::progress::waiting(app,&id).await? {line.push_str(&format!("\nTelegram 要求等待 {} 秒，加 60 秒后自动继续；剩余 {} 秒。",wait.seconds,(wait.retry_at-unix_time()).max(0)));}
                 if report.search_retry>0 {
                     let wait=report.search_retry_at.map(|at|(at-crate::domain::unix_time()).max(0));
                     line.push_str(&format!("\n搜索重试：第 {}/20 轮，已保存 {} 页；{}",report.search_retry,report.pages,wait.map(|seconds|format!("约 {seconds} 秒后点击原消息的下一页")).unwrap_or_else(||"正在点击并等待新回复".into())));
@@ -793,7 +802,7 @@ pub async fn command(
             app.cancel(&id).await?;Ok("停止请求已提交，已完成记录保留。".into())
         },
         "/clear"=>Ok(format!("已清空 {} 个排队任务。",app.store.clear_queue().await?)),
-        "/retry"=>{let id=words.get(1).ok_or_else(||anyhow::anyhow!("missing_job_id"))?;app.store.retry(id,false).await?;app.notify.notify_one();Ok("已重新排队。".into())},
+        "/retry"=>{let id=words.get(1).ok_or_else(||anyhow::anyhow!("missing_job_id"))?;app.store.retry(id,false).await?;app.notify.notify_one();Ok(format!("已重新排队：{id}"))},
         "/search"=>{
             let (keyword,pages,resume)=commands::search_args(&words[1..].join(" "));
             let id=app.enqueue(JobPayload::Search{keyword,pages,sort:None,resume},Some(chat),update).await?;

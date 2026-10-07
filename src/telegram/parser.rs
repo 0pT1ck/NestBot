@@ -191,7 +191,7 @@ pub fn claim_rate_wait(text: &str) -> Option<u64> {
                     .map(|n| n.saturating_mul(if &c[2] == "秒" { 1 } else { 60 }))
             })
             .unwrap_or(60)
-            .clamp(1, 3600),
+            .clamp(1, u32::MAX as u64),
     )
 }
 

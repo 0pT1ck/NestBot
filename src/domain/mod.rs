@@ -87,6 +87,14 @@ pub struct JobReport {
     pub search_retry: u32,
     pub search_retry_at: Option<i64>,
     pub search_page: Option<u32>,
+    pub search_total_pages: Option<u32>,
+    pub transfer_key: Option<u32>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub struct JobWait {
+    pub seconds: u64,
+    pub retry_at: i64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

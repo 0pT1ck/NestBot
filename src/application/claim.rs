@@ -11,7 +11,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 struct Collector {
@@ -149,10 +148,11 @@ async fn collect(
     cancel: CancellationToken,
     mut receiver: tokio::sync::broadcast::Receiver<grammers_client::message::Message>,
 ) -> anyhow::Result<u32> {
-    let mut deadline = Instant::now() + Duration::from_secs(timeout);
+    let clock = crate::telegram::ActiveClock::new();
+    let mut deadline = Duration::from_secs(timeout);
     let mut initial_batch = true;
     let mut count = 0u32;
-    let mut last = Instant::now();
+    let mut last = clock.elapsed();
     let mut last_id = after;
     let mut navigation = BTreeMap::new();
     let mut clicked: HashMap<i32, String> = HashMap::new();
@@ -160,12 +160,12 @@ async fn collect(
     let mut saw_reply = false;
     let mut limited = None;
     let mut latest_reply = after;
-    let mut awaiting_group: Option<(i32, Instant)> = None;
+    let mut awaiting_group: Option<(i32, Duration)> = None;
     let mut poll = tokio::time::interval(Duration::from_secs(3));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut updates_open = true;
     loop {
-        if Instant::now() >= deadline && (!saw_reply || !initial_batch) {
+        if clock.elapsed() >= deadline && (!saw_reply || !initial_batch) {
             break;
         }
         let event = tokio::select! {
@@ -191,7 +191,7 @@ async fn collect(
                 last_id = scan.newest;
                 if scan.inserted > 0 {
                     count += scan.inserted;
-                    last = Instant::now();
+                    last = clock.elapsed();
                     saw_reply = true;
                 }
                 if awaiting_group.is_some_and(|(id, _)| scan.latest > id) {
@@ -214,7 +214,7 @@ async fn collect(
             latest_reply = latest_reply.max(message.id());
             let changed = seen.get(&message.id()) != Some(&message.raw);
             if changed {
-                last = Instant::now();
+                last = clock.elapsed();
                 seen.insert(message.id(), message.raw.clone());
                 saw_reply = true;
             }
@@ -247,7 +247,7 @@ async fn collect(
                     .await?
             {
                 count += 1;
-                last = Instant::now();
+                last = clock.elapsed();
                 saw_reply = true;
             }
         }
@@ -257,7 +257,7 @@ async fn collect(
         // Refresh navigation even if no new message was emitted: the bot can
         // edit the label while reusing exactly the same callback bytes.
         let ids = navigation.keys().copied().collect::<Vec<_>>();
-        if !ids.is_empty() && last.elapsed() >= Duration::from_secs(3) {
+        if !ids.is_empty() && clock.elapsed().saturating_sub(last) >= Duration::from_secs(3) {
             for message in bounded(&cancel, request_timeout, account.refresh(peer, &ids)).await? {
                 if let Some((label, data)) =
                     parser::callback_button(&message, &["全部获取", "查看下一组", "下一组"])
@@ -268,12 +268,15 @@ async fn collect(
                 }
             }
         }
-        if awaiting_group.is_some_and(|(_, until)| Instant::now() >= until) {
+        if awaiting_group.is_some_and(|(_, until)| clock.elapsed() >= until) {
             break;
         }
-        if saw_reply && awaiting_group.is_none() && last.elapsed() >= Duration::from_secs(8) {
+        if saw_reply
+            && awaiting_group.is_none()
+            && clock.elapsed().saturating_sub(last) >= Duration::from_secs(8)
+        {
             if initial_batch {
-                deadline = Instant::now() + Duration::from_secs(timeout);
+                deadline = clock.elapsed() + Duration::from_secs(timeout);
                 initial_batch = false;
             }
             if let Some((message, label, data)) = navigation
@@ -300,12 +303,12 @@ async fn collect(
                     break;
                 }
                 clicked.insert(message.id(), label);
-                last = Instant::now();
+                last = clock.elapsed();
                 awaiting_group = Some((
                     latest_reply,
-                    Instant::now()
+                    clock.elapsed()
                         + deadline
-                            .saturating_duration_since(Instant::now())
+                            .saturating_sub(clock.elapsed())
                             .clamp(Duration::from_secs(30), Duration::from_secs(60)),
                 ));
                 continue;
@@ -376,7 +379,7 @@ async fn once(
     .await?;
     let stop = cancel.child_token();
     let mut collector = Collector {
-        task: tokio::spawn(collect(
+        task: tokio::spawn(crate::telegram::inherit_flood_context(collect(
             account.clone(),
             app.store.clone(),
             job.summary.id.clone(),
@@ -388,7 +391,7 @@ async fn once(
             timeout,
             stop.clone(),
             receiver,
-        )),
+        ))),
         stop,
     };
     let mut count = 0;
@@ -581,25 +584,17 @@ pub async fn run(
         app.store.save_report(&job.summary.id, &report).await?;
         return Ok(true);
     }
-    for round in 0..=5 {
+    loop {
         match once(
             app, job, payload, expected, mode, target, redo, dry, batch, cancel,
         )
         .await
         {
-            Err(error) if error.downcast_ref::<BotRateLimit>().is_some() && round < 5 => {
-                let seconds = error
-                    .downcast_ref::<BotRateLimit>()
-                    .unwrap()
-                    .0
-                    .clamp(1, 3600);
+            Err(error) if error.downcast_ref::<BotRateLimit>().is_some() => {
+                let seconds = error.downcast_ref::<BotRateLimit>().unwrap().0.max(1);
                 app.progress(&job.summary.id, "claim_waiting", 0, expected.map(u64::from))
                     .await?;
-                bounded(cancel, seconds + 1, async {
-                    tokio::time::sleep(Duration::from_secs(seconds)).await;
-                    Ok(())
-                })
-                .await?;
+                crate::telegram::wait_flood(cancel, seconds).await?;
             }
             result => {
                 let mut report = app.store.report(&job.summary.id).await?;
@@ -636,7 +631,6 @@ pub async fn run(
             }
         }
     }
-    Ok(false)
 }
 
 #[cfg(test)]

@@ -1,6 +1,87 @@
 use super::*;
 use grammers_tl_types::{enums, types};
 use std::{collections::VecDeque, sync::Mutex};
+use tokio::time::Instant;
+
+struct FloodReplay {
+    inner: Arc<Replay>,
+    waited: std::sync::atomic::AtomicBool,
+}
+impl ClaimSource for FloodReplay {
+    async fn scan(
+        &self,
+        store: &Store,
+        job: &str,
+        claim: &str,
+        peer: PeerRef,
+        after: i32,
+        cancel: &CancellationToken,
+        timeout: u64,
+    ) -> anyhow::Result<Scan> {
+        if !self.waited.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            bounded(cancel, 2, crate::telegram::wait_flood(cancel, 763)).await?;
+        }
+        self.inner
+            .scan(store, job, claim, peer, after, cancel, timeout)
+            .await
+    }
+    async fn refresh(&self, peer: PeerRef, ids: &[i32]) -> anyhow::Result<Vec<Message>> {
+        self.inner.refresh(peer, ids).await
+    }
+    async fn click(
+        &self,
+        peer: PeerRef,
+        message: &Message,
+        data: Vec<u8>,
+    ) -> anyhow::Result<Option<String>> {
+        self.inner.click(peer, message, data).await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn collector_waits_823_seconds_then_saves_media_and_ends_after_normal_quiet_window() {
+    let (_dir, app) = crate::interfaces::progress::tests::fixture();
+    let job = crate::interfaces::progress::tests::job(&app).await;
+    let peer = message(1, None, true).peer_ref().await.unwrap().unwrap();
+    let source = Arc::new(FloodReplay {
+        inner: Replay::new(vec![message(1, None, true)], vec![]),
+        waited: std::sync::atomic::AtomicBool::new(false),
+    });
+    let (tx, rx) = tokio::sync::broadcast::channel(4);
+    drop(tx);
+    let cancel = CancellationToken::new();
+    let start = Instant::now();
+    let count = crate::application::progress::observe(
+        &app,
+        &job,
+        &cancel,
+        collect(
+            source,
+            app.store.clone(),
+            job.summary.id.clone(),
+            "synthetic-claim".into(),
+            peer,
+            0,
+            None,
+            30,
+            2,
+            cancel.clone(),
+            rx,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+    assert!(start.elapsed() >= Duration::from_secs(823));
+    assert!(start.elapsed() < Duration::from_secs(840));
+    assert!(
+        !app.store
+            .inbox_next(&job.summary.id, "synthetic-claim")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
 
 fn message(id: i32, label: Option<&str>, media: bool) -> Message {
     let mut message = crate::application::search::tests::message("");

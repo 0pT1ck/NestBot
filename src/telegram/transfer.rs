@@ -21,6 +21,10 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+#[path = "transfer_tests.rs"]
+mod tests;
+
 pub fn media_id(media: &Media) -> Option<String> {
     match media {
         Media::Photo(photo) => Some(format!("p:{}", photo.id())),
@@ -175,16 +179,18 @@ async fn upload(
         .upload_stream(&mut stream, size as usize, name);
     tokio::pin!(future);
     let mut last_bytes = 0;
-    let mut last_progress = Instant::now();
+    let clock = super::ActiveClock::new();
+    let mut last_progress = Duration::ZERO;
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     let uploaded = loop {
         tokio::select! {
             _=cancel.cancelled()=>anyhow::bail!("cancelled"),
             result=&mut future=>break result.map_err(|_|anyhow::anyhow!("upload_failed"))?,
             _=tick.tick()=>{
+                let active_time=clock.elapsed();
                 let bytes=count.load(Ordering::Relaxed);
-                if bytes!=last_bytes {last_bytes=bytes;last_progress=Instant::now();}
-                anyhow::ensure!(last_progress.elapsed()<Duration::from_secs(app.config.limits.transfer_stall_secs),"telegram_timeout");
+                if bytes!=last_bytes {last_bytes=bytes;last_progress=last_progress.max(active_time);}
+                anyhow::ensure!(active_time.saturating_sub(last_progress)<Duration::from_secs(app.config.limits.transfer_stall_secs),"telegram_timeout");
                 app.progress(&job.summary.id,"upload",bytes,Some(size)).await?;
             }
         }
@@ -442,20 +448,30 @@ pub async fn incoming(
             .transfer_intent(&scope, &media, &job.summary.id, false)
             .await?;
         let copied = bounded(cancel, app.config.limits.request_timeout_secs, async {
-            bot.copy_messages(
-                destination.clone(),
-                ChatId(source_chat),
-                ids.iter().copied().map(MessageId),
-            )
-            .await
-            .map_err(|error| match error {
-                teloxide::RequestError::Api(_)
-                | teloxide::RequestError::MigrateToChatId(_)
-                | teloxide::RequestError::RetryAfter(_) => {
-                    anyhow::Error::new(super::TelegramRejected)
+            loop {
+                match bot
+                    .copy_messages(
+                        destination.clone(),
+                        ChatId(source_chat),
+                        ids.iter().copied().map(MessageId),
+                    )
+                    .await
+                {
+                    Ok(copied) => break Ok(copied),
+                    Err(teloxide::RequestError::RetryAfter(seconds)) => {
+                        super::wait_flood(cancel, seconds.seconds() as u64).await?;
+                    }
+                    Err(error) => {
+                        break Err(match error {
+                            teloxide::RequestError::Api(_)
+                            | teloxide::RequestError::MigrateToChatId(_) => {
+                                anyhow::Error::new(super::TelegramRejected)
+                            }
+                            _ => anyhow::anyhow!("bot_copy_failed"),
+                        });
+                    }
                 }
-                _ => anyhow::anyhow!("bot_copy_failed"),
-            })
+            }
         })
         .await;
         let copied = match copied {

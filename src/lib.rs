@@ -22,6 +22,7 @@ pub async fn serve(config: config::Config, store: storage::Store) -> anyhow::Res
     services.spawn(interfaces::control::serve(app.clone()));
     if app.bot.is_some() {
         services.spawn(interfaces::bot::run(app.clone()));
+        services.spawn(interfaces::progress::run(app.clone()));
     }
     if let Some(web) = web {
         services.spawn(interfaces::web::serve(web));

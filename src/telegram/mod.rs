@@ -32,6 +32,76 @@ impl std::error::Error for RetryLater {}
 tokio::task_local! {
     // Nested transfer and RPC deadlines must both exclude server-requested waits.
     static FLOOD_BUDGETS: Vec<watch::Sender<Duration>>;
+    static FLOOD_EVENTS: watch::Sender<Option<FloodNotice>>;
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FloodNotice {
+    pub wait: crate::domain::JobWait,
+    pub until: tokio::time::Instant,
+}
+
+pub(crate) fn flood_delay(seconds: u64) -> Duration {
+    let delay = Duration::from_secs(seconds.saturating_add(60));
+    let _ = FLOOD_BUDGETS.try_with(|budgets| {
+        for budget in budgets {
+            budget.send_modify(|total| *total += delay);
+        }
+    });
+    let _ = FLOOD_EVENTS.try_with(|events| {
+        let notice = FloodNotice {
+            wait: crate::domain::JobWait {
+                seconds,
+                retry_at: crate::domain::unix_time().saturating_add(delay.as_secs() as i64),
+            },
+            until: tokio::time::Instant::now() + delay,
+        };
+        events.send_if_modified(|current| {
+            if current.is_none_or(|old| old.until <= notice.until) {
+                *current = Some(notice);
+                true
+            } else {
+                false
+            }
+        });
+    });
+    delay
+}
+
+pub(crate) async fn wait_flood(cancel: &CancellationToken, seconds: u64) -> anyhow::Result<()> {
+    let delay = flood_delay(seconds);
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => anyhow::bail!("cancelled"),
+        _ = tokio::time::sleep(delay) => Ok(()),
+    }
+}
+
+pub(crate) async fn flood_scope<T>(
+    events: watch::Sender<Option<FloodNotice>>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    FLOOD_EVENTS.scope(events, future).await
+}
+
+// Tokio tasks do not inherit task locals. The media collector must report its
+// waits to the same job and extend the enclosing transfer deadlines as well.
+pub(crate) fn inherit_flood_context<T>(
+    future: impl std::future::Future<Output = T>,
+) -> impl std::future::Future<Output = T> {
+    let budgets = FLOOD_BUDGETS.try_with(Clone::clone).unwrap_or_default();
+    let events = FLOOD_EVENTS.try_with(Clone::clone).ok();
+    async move {
+        FLOOD_BUDGETS
+            .scope(budgets, async move {
+                if let Some(events) = events {
+                    flood_scope(events, future).await
+                } else {
+                    future.await
+                }
+            })
+            .await
+    }
 }
 
 pub(crate) fn flood_waited() -> Duration {
@@ -45,24 +115,39 @@ pub(crate) fn flood_waited() -> Duration {
         .unwrap_or_default()
 }
 
-struct PythonFloodSleep;
-impl RetryPolicy for PythonFloodSleep {
+pub(crate) struct ActiveClock {
+    start: tokio::time::Instant,
+    flood_origin: Duration,
+}
+
+impl ActiveClock {
+    pub(crate) fn new() -> Self {
+        Self {
+            start: tokio::time::Instant::now(),
+            flood_origin: flood_waited(),
+        }
+    }
+
+    pub(crate) fn elapsed(&self) -> Duration {
+        self.start
+            .elapsed()
+            .saturating_sub(flood_waited().saturating_sub(self.flood_origin))
+    }
+}
+
+struct TelegramFloodSleep;
+impl RetryPolicy for TelegramFloodSleep {
     fn should_retry(&self, ctx: &RetryContext) -> ControlFlow<(), Duration> {
         let InvocationError::Rpc(error) = &ctx.error else {
             return ControlFlow::Break(());
         };
         let seconds = error.value.unwrap_or(60).max(1) as u64;
-        // Match Telethon's default short flood waits and finite request retries.
-        // Never replay ambiguous network failures or restart an entire claim/job.
-        if error.code != 420 || seconds > 60 || ctx.fail_count.get() > 5 {
+        // Telegram definitively rejected this RPC. Grammers retries its original
+        // serialized request, preserving random IDs; ambiguous failures never retry.
+        if error.code != 420 {
             return ControlFlow::Break(());
         }
-        let delay = Duration::from_secs(seconds);
-        let _ = FLOOD_BUDGETS.try_with(|budgets| {
-            for budget in budgets {
-                budget.send_modify(|total| *total += delay);
-            }
-        });
+        let delay = flood_delay(seconds);
         tracing::warn!(
             event = "telegram_flood_wait",
             seconds,
@@ -172,7 +257,7 @@ impl Account {
         let client = Client::with_configuration(
             handle,
             ClientConfiguration {
-                retry_policy: Box::new(PythonFloodSleep),
+                retry_policy: Box::new(TelegramFloodSleep),
                 auto_cache_peers: true,
             },
         );
@@ -416,33 +501,36 @@ mod flood_tests {
     }
 
     #[test]
-    fn only_definitive_short_floods_retry_with_finite_attempts() {
-        for attempt in 1..=5 {
+    fn all_definitive_floods_wait_an_extra_minute_without_replaying_network_errors() {
+        for attempt in 1..=20 {
             assert_eq!(
-                PythonFloodSleep.should_retry(&context(60, attempt)),
-                ControlFlow::Continue(Duration::from_secs(60))
+                TelegramFloodSleep.should_retry(&context(60, attempt)),
+                ControlFlow::Continue(Duration::from_secs(120))
             );
         }
-        assert!(PythonFloodSleep.should_retry(&context(61, 1)).is_break());
-        assert!(PythonFloodSleep.should_retry(&context(1, 6)).is_break());
+        assert_eq!(
+            TelegramFloodSleep.should_retry(&context(763, 6)),
+            ControlFlow::Continue(Duration::from_secs(823))
+        );
         let mut ctx = context(1, 1);
         ctx.error = InvocationError::Dropped;
-        assert!(PythonFloodSleep.should_retry(&ctx).is_break());
+        assert!(TelegramFloodSleep.should_retry(&ctx).is_break());
         ctx.error = InvocationError::Rpc(grammers_mtsender::RpcError {
             code: 400,
             name: "BAD_REQUEST".into(),
             value: None,
             caused_by: None,
         });
-        assert!(PythonFloodSleep.should_retry(&ctx).is_break());
+        assert!(TelegramFloodSleep.should_retry(&ctx).is_break());
     }
 
     async fn simulate_request() -> anyhow::Result<u32> {
         let mut accepted = 59;
         for attempt in 1..=2 {
-            let ControlFlow::Continue(delay) = PythonFloodSleep.should_retry(&context(60, attempt))
+            let ControlFlow::Continue(delay) =
+                TelegramFloodSleep.should_retry(&context(60, attempt))
             else {
-                panic!("short rejection must wait");
+                panic!("definitive rejection must wait");
             };
             tokio::time::sleep(delay).await;
         }
@@ -483,12 +571,12 @@ mod flood_tests {
         let cancel = CancellationToken::new();
         let start = tokio::time::Instant::now();
         let result: anyhow::Result<()> = bounded(&cancel, 2, async {
-            let _ = PythonFloodSleep.should_retry(&context(60, 1));
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            let _ = TelegramFloodSleep.should_retry(&context(60, 1));
+            tokio::time::sleep(Duration::from_secs(120)).await;
             std::future::pending().await
         })
         .await;
         assert_eq!(result.unwrap_err().to_string(), "telegram_timeout");
-        assert_eq!(start.elapsed(), Duration::from_secs(62));
+        assert_eq!(start.elapsed(), Duration::from_secs(122));
     }
 }

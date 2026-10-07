@@ -401,6 +401,7 @@ pub async fn run(
     report.search_retry = 0;
     report.search_retry_at = None;
     report.search_page = None;
+    report.search_total_pages = None;
     report
         .warnings
         .retain(|warning| !warning.starts_with("search_"));
@@ -677,6 +678,13 @@ async fn paginate(
     let mut collected = 0u32;
     let mut first = reused;
     let mut retries = 0;
+    if reused {
+        let page = parse(&reply);
+        let mut report = app.store.report(&job.summary.id).await?;
+        report.search_page = page.page;
+        report.search_total_pages = page.total_pages;
+        app.store.save_report(&job.summary.id, &report).await?;
+    }
     loop {
         if !first {
             let page = parser::parse_search(
@@ -706,6 +714,7 @@ async fn paginate(
                 let recovered = report.search_retry > 0;
                 report.pages = collected;
                 report.search_page = Some(current);
+                report.search_total_pages = page.total_pages;
                 report.search_retry = 0;
                 report.search_retry_at = None;
                 app.store.save_report(&job.summary.id, &report).await?;

@@ -61,7 +61,7 @@ pub async fn worker(app: Arc<App>, fast: bool) -> anyhow::Result<()> {
                 use teloxide::prelude::*;
                 let mut progress = String::new();
                 if let Some(seconds) = rate_wait {
-                    progress.push_str(&format!("\nTelegram 要求等待 {seconds} 秒；短期限流已自动等待，长等待或连续限流暂停本次任务。已完成部分保留，等待后可重新执行原命令续传。"));
+                    progress.push_str(&format!("\nTelegram 要求等待 {seconds} 秒；该请求未能进入自动等待，已完成部分保留。可在 {} 秒后重新执行原命令续传。", seconds.saturating_add(60)));
                 }
                 if report.pages > 0 {
                     progress.push_str(&format!("\n已保存 {} 页搜索结果。", report.pages));
