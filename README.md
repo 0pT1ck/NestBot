@@ -44,6 +44,8 @@ Web 默认地址：http://127.0.0.1:8787。管理密码至少 12 字符；密钥
 
 CLI 搜索默认一页；Bot `/search` 默认搜全页。原 Python 业务规则的对齐范围、数据库兼容与离线测试记录见 [Python 行为对齐](docs/python-parity.md)。
 
+同一关键词重复搜索会合并到同一个密钥夹，按密钥去重。不同关键词的相同密钥共享完成记录，因此新密钥夹也可能已有部分“已转”。搜索翻页停住时任务显示 `partial` 并保留结果；使用 `/search 关键词 continue` 续搜，使用 `/batch` 转存。
+
 ## Bot
 
 配置 `telegram.allowed_users` 和 `TELEGRAM_BOT_TOKEN`；白名单为空时不接受任务。把 bot 加入目标频道并授予发消息及编辑权限。

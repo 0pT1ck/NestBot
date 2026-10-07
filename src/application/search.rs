@@ -5,8 +5,9 @@ use crate::{
 };
 use grammers_client::message::Message;
 use grammers_session::types::PeerRef;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::broadcast;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 trait PageHistory: Sync {
@@ -48,7 +49,23 @@ enum PageState {
     End,
 }
 
-fn page_ready(message: &Message, previous: Option<&Message>) -> anyhow::Result<PageState> {
+#[derive(Clone, Copy)]
+enum PageMode<'a> {
+    Initial,
+    Next(&'a Message),
+    Sort(&'a Message),
+}
+impl<'a> PageMode<'a> {
+    fn previous(self) -> Option<&'a Message> {
+        match self {
+            Self::Initial => None,
+            Self::Next(message) | Self::Sort(message) => Some(message),
+        }
+    }
+}
+
+fn page_ready(message: &Message, mode: PageMode<'_>) -> anyhow::Result<PageState> {
+    let previous = mode.previous();
     let page = parser::parse_search(
         message.text(),
         &parser::line_links(
@@ -58,6 +75,10 @@ fn page_ready(message: &Message, previous: Option<&Message>) -> anyhow::Result<P
     );
     if !page.entries.is_empty() {
         if let Some(p) = previous {
+            let old = parse(p);
+            if !old.keyword.is_empty() && !page.keyword.is_empty() && old.keyword != page.keyword {
+                return Ok(PageState::Pending);
+            }
             let same_content =
                 p.text() == message.text() && p.fmt_entities() == message.fmt_entities();
             // Navigation can disappear without changing the final page's text.
@@ -68,6 +89,13 @@ fn page_ready(message: &Message, previous: Option<&Message>) -> anyhow::Result<P
                 return Ok(PageState::End);
             }
             if p.id() == message.id() && same_content && p.reply_markup() == message.reply_markup()
+            {
+                return Ok(PageState::Pending);
+            }
+            // Queued edits/history from an earlier page cannot advance pagination.
+            // Sorting intentionally replaces entries while staying on the same page.
+            if matches!(mode, PageMode::Next(_))
+                && old.page.zip(page.page).is_some_and(|(old, new)| new <= old)
             {
                 return Ok(PageState::Pending);
             }
@@ -97,28 +125,90 @@ fn processing(text: &str) -> bool {
         .any(|s| text.contains(s))
 }
 
+fn settle(
+    candidate: &mut Option<(Message, PageState, Instant)>,
+    message: Message,
+    state: PageState,
+) {
+    if let Some((old, _, _)) = candidate
+        && (old.raw == message.raw
+            || parse(old)
+                .page
+                .zip(parse(&message).page)
+                .is_some_and(|(old, new)| new < old))
+    {
+        return;
+    }
+    *candidate = Some((message, state, Instant::now()));
+}
+
+fn resume_start(cursor: Option<(u32, Option<i32>)>, reused: bool, reply: &Message) -> u32 {
+    let page = if reused {
+        parse(reply).page.or(cursor.map(|(page, _)| page))
+    } else {
+        cursor.map(|(page, _)| page)
+    };
+    page.map(|page| page + 1).unwrap_or(1)
+}
+
 async fn wait_page(
     account: &impl PageHistory,
     receiver: &mut broadcast::Receiver<Message>,
     peer: PeerRef,
     after: i32,
-    previous: Option<&Message>,
+    mode: PageMode<'_>,
     timeout: u64,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Option<Message>> {
+    bounded(
+        cancel,
+        timeout.saturating_mul(2),
+        wait_page_inner(account, receiver, peer, after, mode, timeout, cancel),
+    )
+    .await
+}
+
+async fn wait_page_inner(
+    account: &impl PageHistory,
+    receiver: &mut broadcast::Receiver<Message>,
+    peer: PeerRef,
+    after: i32,
+    mode: PageMode<'_>,
+    timeout: u64,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Option<Message>> {
+    let previous = mode.previous();
     let mut deadline = Instant::now() + Duration::from_secs(timeout);
+    let mut flood_origin = crate::telegram::flood_waited();
     let mut next_poll = Instant::now();
     let mut updates_open = true;
     let mut best: Option<Message> = None;
     let mut seen = std::collections::BTreeMap::new();
     let mut last_new = Instant::now();
+    let mut candidate: Option<(Message, PageState, Instant)> = None;
+    let mut notice: Option<Message> = None;
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        anyhow::ensure!(!cancel.is_cancelled(), "cancelled");
+        if candidate
+            .as_ref()
+            .is_some_and(|(_, _, changed)| changed.elapsed() >= Duration::from_millis(800))
+        {
+            let (message, state, _) = candidate.take().unwrap();
+            return Ok((state == PageState::Ready).then_some(message));
+        }
+        let flood_delay = crate::telegram::flood_waited().saturating_sub(flood_origin);
+        let remaining = (deadline + flood_delay).saturating_duration_since(Instant::now());
         if remaining.is_zero()
             || (previous.is_none()
                 && best.is_some()
                 && last_new.elapsed() >= Duration::from_secs(35))
+            || (notice.is_some()
+                && candidate.is_none()
+                && last_new.elapsed() >= Duration::from_secs(35))
         {
+            if previous.is_some() && notice.is_some() {
+                return Ok(notice);
+            }
             if previous.is_none() && best.is_some() {
                 return Ok(best);
             }
@@ -126,20 +216,23 @@ async fn wait_page(
         }
         tokio::select! {
             _=cancel.cancelled()=>anyhow::bail!("cancelled"),
-            result=tokio::time::timeout(remaining.min(Duration::from_secs(3)),async {
+            result=tokio::time::timeout(remaining.min(candidate.as_ref().map(|(_,_,changed)| Duration::from_millis(800).saturating_sub(changed.elapsed())).unwrap_or(Duration::from_secs(3))),async {
                 if updates_open {receiver.recv().await} else {std::future::pending().await}
             })=>{
                 match result {
                     Ok(Ok(message)) if message.peer_id()==peer.id && !message.outgoing() && (message.id()>after || previous.is_some_and(|p|p.id()==message.id()))=>{
                         let first_reply = seen.is_empty();
+                        if previous.is_some_and(|p| p.raw != message.raw) && parse(&message).entries.is_empty() { notice=Some(message.clone()); }
                         if observe(&mut seen, &mut best, &message) {
-                            if previous.is_none() && first_reply {deadline=Instant::now()+Duration::from_secs(timeout);}
+                            if previous.is_none() && first_reply {deadline=Instant::now()+Duration::from_secs(timeout);flood_origin=crate::telegram::flood_waited();}
                             last_new=Instant::now();
                         }
-                        match page_ready(&message, previous)? {
-                            PageState::Ready => return Ok(Some(message)),
-                            PageState::End => return Ok(None),
-                            PageState::Pending => {},
+                        match page_ready(&message, mode)? {
+                            PageState::Ready if previous.is_none() => return Ok(Some(message)),
+                            state @ (PageState::End | PageState::Ready) => { settle(&mut candidate, message, state); },
+                            PageState::Pending => {
+                                if candidate.as_ref().is_some_and(|(m,_,_)| m.id()==message.id()) && processing(message.text()) {candidate=None;}
+                            },
                         }
                     }
                     Ok(Err(broadcast::error::RecvError::Closed)) => updates_open=false,
@@ -149,16 +242,29 @@ async fn wait_page(
                 next_poll = Instant::now() + Duration::from_secs(3);
                 // Read recent replies even when the update stream dropped a message,
                 // including the initial response and edits to processing placeholders.
-                let messages = bounded(cancel,remaining.as_secs().max(1).min(timeout),account.poll(peer, after, previous.map(Message::id))).await?;
+                // History is a read-only fallback. A transient read failure must
+                // not discard a healthy update stream or the whole search.
+                let messages = match bounded(cancel,remaining.as_secs().clamp(1,10),account.poll(peer, after, previous.map(Message::id))).await {
+                    Ok(messages) => messages,
+                    Err(error) if cancel.is_cancelled() || error.downcast_ref::<RetryLater>().is_some() => return Err(error),
+                    Err(error) => {
+                        tracing::warn!(event="search_history_failed",error_code=crate::telemetry::safe_error(&error));
+                        continue;
+                    },
+                };
                 for message in messages {
                     let first_reply = seen.is_empty();
+                    if previous.is_some_and(|p| p.raw != message.raw) && parse(&message).entries.is_empty() { notice=Some(message.clone()); }
                     if observe(&mut seen, &mut best, &message) {
-                        if previous.is_none() && first_reply {deadline=Instant::now()+Duration::from_secs(timeout);}
+                        if previous.is_none() && first_reply {deadline=Instant::now()+Duration::from_secs(timeout);flood_origin=crate::telegram::flood_waited();}
                         last_new=Instant::now();
                     }
-                    match page_ready(&message, previous)? {
-                        PageState::Ready => return Ok(Some(message)),
-                        PageState::End => return Ok(None),
+                    match page_ready(&message, mode)? {
+                        PageState::Ready if previous.is_none() => return Ok(Some(message)),
+                        state @ (PageState::End | PageState::Ready) => {
+                            // Replayed history must not postpone the edit settling window.
+                            settle(&mut candidate, message, state);
+                        },
                         PageState::Pending => {},
                     }
                 }
@@ -214,6 +320,12 @@ pub async fn run(
     resume: bool,
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
+    let mut report = app.store.report(&job.summary.id).await?;
+    report.pages = 0;
+    report
+        .warnings
+        .retain(|warning| !warning.starts_with("search_"));
+    app.store.save_report(&job.summary.id, &report).await?;
     let account = app.users.account(false, cancel).await?;
     let timeout = app.config.limits.request_timeout_secs;
     let peer = bounded(
@@ -267,7 +379,7 @@ pub async fn run(
                 &mut receiver,
                 peer,
                 sent.id(),
-                None,
+                PageMode::Initial,
                 timeout,
                 cancel,
             )
@@ -301,7 +413,7 @@ pub async fn run(
                 &mut receiver,
                 peer,
                 sent.id(),
-                None,
+                PageMode::Initial,
                 timeout,
                 cancel,
             )
@@ -324,7 +436,7 @@ pub async fn run(
                 &mut receiver,
                 peer,
                 reply.id(),
-                Some(&reply),
+                PageMode::Sort(&reply),
                 timeout,
                 cancel,
             )
@@ -339,7 +451,9 @@ pub async fn run(
             }
         }
     }
-    let minimum = cursor.map(|(page, _)| page + 1).unwrap_or(1);
+    // Older databases could pair the maximum saved page with a newer search's
+    // earlier message. Trust the actual reused message when it has a page label.
+    let minimum = resume_start(cursor, reused, &reply);
     let mut collected = 0u32;
     let mut first = reused;
     let mut retries = 0;
@@ -396,11 +510,11 @@ pub async fn run(
             Ok(answer) => answer,
             Err(error) if error.downcast_ref::<RetryLater>().is_some() => return Err(error),
             Err(error) if cancel.is_cancelled() => return Err(error),
-            Err(_) => {
-                app.store
-                    .warning(&job.summary.id, "search_page_stalled")
-                    .await?;
-                break;
+            Err(error) => {
+                // A callback acknowledgement may fail while the bot still edits
+                // its result. Observe that edit before declaring pagination stuck.
+                tracing::warn!(event="search_callback_failed",job_id=%job.summary.id,error_code=crate::telemetry::safe_error(&error));
+                None
             }
         };
         if answer.as_deref().is_some_and(parser::search_end) {
@@ -414,7 +528,7 @@ pub async fn run(
                 &mut receiver,
                 peer,
                 reply.id(),
-                Some(&reply),
+                PageMode::Next(&reply),
                 timeout,
                 cancel,
             )
@@ -423,7 +537,8 @@ pub async fn run(
                 Ok(next) => next,
                 Err(error) if error.downcast_ref::<RetryLater>().is_some() => return Err(error),
                 Err(error) if cancel.is_cancelled() => return Err(error),
-                Err(_) => {
+                Err(error) => {
+                    tracing::warn!(event="search_page_wait_failed",job_id=%job.summary.id,error_code=crate::telemetry::safe_error(&error),page=parse(&reply).page);
                     app.store
                         .warning(&job.summary.id, "search_page_stalled")
                         .await?;
@@ -474,253 +589,5 @@ fn parse(message: &Message) -> parser::SearchPage {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
-    use grammers_client::{Client, message::InputMessage};
-    use grammers_mtsender::{ConnectionParams, SenderPool};
-    use grammers_session::{storages::MemorySession, types::PeerId};
-    use std::sync::{Arc, Mutex};
-
-    #[test]
-    fn history_replay_does_not_reset_quiet_time_and_best_reply_matches_python() {
-        let mut seen = std::collections::BTreeMap::new();
-        let mut best = None;
-        let mut result = message("🔎 搜索词：synthetic\n第 1 页，等待中");
-        if let grammers_tl_types::enums::Message::Message(raw) = &mut result.raw {
-            raw.id = 101;
-        }
-        let mut notice = message("处理中");
-        if let grammers_tl_types::enums::Message::Message(raw) = &mut notice.raw {
-            raw.id = 102;
-        }
-        assert!(observe(&mut seen, &mut best, &result));
-        assert!(observe(&mut seen, &mut best, &notice));
-        assert_eq!(best.as_ref().unwrap().id(), 101);
-        assert!(!observe(&mut seen, &mut best, &result));
-        assert!(!observe(&mut seen, &mut best, &notice));
-        if let grammers_tl_types::enums::Message::Message(raw) = &mut result.raw {
-            raw.message = "🔎 搜索词：synthetic\n密钥：synthetic-key\n第 1 页".into();
-        }
-        assert!(observe(&mut seen, &mut best, &result));
-        assert!(best.as_ref().unwrap().text().contains("synthetic-key"));
-    }
-
-    pub(crate) fn message(text: &str) -> Message {
-        let SenderPool { handle, .. } = SenderPool::with_configuration(
-            Arc::new(MemorySession::default()),
-            1,
-            ConnectionParams::default(),
-        );
-        let client = Client::new(handle);
-        let peer = PeerRef {
-            id: PeerId::from_bot_api_dialog_id(42).unwrap(),
-            auth: Default::default(),
-        };
-        Message::from_raw_short_updates(
-            &client,
-            grammers_tl_types::types::UpdateShortSentMessage {
-                out: false,
-                id: 11,
-                pts: 1,
-                pts_count: 1,
-                date: 1,
-                media: None,
-                entities: None,
-                ttl_period: None,
-            },
-            InputMessage::new().text(text),
-            peer,
-        )
-    }
-
-    struct History(Mutex<Vec<Message>>);
-    impl PageHistory for History {
-        async fn poll(&self, _: PeerRef, _: i32, _: Option<i32>) -> anyhow::Result<Vec<Message>> {
-            Ok(std::mem::take(&mut *self.0.lock().unwrap()))
-        }
-    }
-
-    fn next_button(message: &mut Message) {
-        use grammers_tl_types::{enums, types};
-        let enums::Message::Message(raw) = &mut message.raw else {
-            panic!("expected message")
-        };
-        raw.reply_markup = Some(
-            types::ReplyInlineMarkup {
-                rows: vec![
-                    types::KeyboardButtonRow {
-                        buttons: vec![
-                            types::KeyboardButtonCallback {
-                                requires_password: false,
-                                style: None,
-                                text: "下一页 ➡️".into(),
-                                data: b"next".to_vec(),
-                            }
-                            .into(),
-                        ],
-                    }
-                    .into(),
-                ],
-            }
-            .into(),
-        );
-    }
-
-    #[tokio::test]
-    async fn final_page_button_removal_is_detected_without_text_change() {
-        let mut old = message("密钥：synthetic-last\n第 2 页");
-        let final_page = old.clone();
-        next_button(&mut old);
-        let peer = old.peer_ref().await.unwrap().unwrap();
-        let (tx, mut rx) = broadcast::channel(4);
-        drop(tx);
-        let received = wait_page(
-            &History(Mutex::new(vec![final_page])),
-            &mut rx,
-            peer,
-            old.id(),
-            Some(&old),
-            1,
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert!(received.is_none());
-    }
-
-    #[tokio::test]
-    async fn separate_end_notice_finishes_pagination() {
-        let old = message("密钥：synthetic-last\n第 2 页");
-        let peer = old.peer_ref().await.unwrap().unwrap();
-        let (tx, mut rx) = broadcast::channel(4);
-        drop(tx);
-        let received = wait_page(
-            &History(Mutex::new(vec![message("已经是最后一页，没有更多结果")])),
-            &mut rx,
-            peer,
-            old.id(),
-            Some(&old),
-            1,
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert!(received.is_none());
-        assert!(parser::search_end("已是最后一页"));
-        assert!(!parser::search_end("第 2 页 / 共 2 页"));
-        assert!(!parser::search_end("正在加载下一页，请稍候"));
-    }
-
-    #[test]
-    fn identical_content_in_a_new_message_is_a_response_but_stale_history_is_not() {
-        let old = message("密钥：synthetic-key");
-        assert_eq!(page_ready(&old, Some(&old)).unwrap(), PageState::Pending);
-        let mut new = old.clone();
-        let grammers_tl_types::enums::Message::Message(raw) = &mut new.raw else {
-            panic!("expected message")
-        };
-        raw.id += 1;
-        assert_eq!(page_ready(&new, Some(&old)).unwrap(), PageState::Ready);
-    }
-
-    #[tokio::test]
-    async fn unchanged_next_page_remains_a_timeout_instead_of_false_success() {
-        let mut old = message("密钥：synthetic-key\n第 2 页 / 共 2 页");
-        next_button(&mut old);
-        let peer = old.peer_ref().await.unwrap().unwrap();
-        let (tx, mut rx) = broadcast::channel(4);
-        drop(tx);
-        let error = wait_page(
-            &History(Mutex::new(vec![old.clone()])),
-            &mut rx,
-            peer,
-            old.id(),
-            Some(&old),
-            1,
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.to_string(), "telegram_timeout");
-    }
-
-    #[tokio::test]
-    async fn processing_placeholder_does_not_resend_before_result_arrives() {
-        let placeholder = message("正在搜索，请稍候……");
-        let result = message("密钥：synthetic-key\n描述：synthetic\n第 1 页");
-        let peer = result.peer_ref().await.unwrap().unwrap();
-        let (tx, mut rx) = broadcast::channel(4);
-        tx.send(placeholder).unwrap();
-        tx.send(result).unwrap();
-        let received = wait_page(
-            &History(Mutex::new(vec![])),
-            &mut rx,
-            peer,
-            10,
-            None,
-            5,
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(received.text().contains("synthetic-key"));
-    }
-
-    #[tokio::test]
-    async fn missing_updates_fall_back_to_history_and_detect_an_edited_page() {
-        let old = message("密钥：synthetic-old\n第 1 页");
-        let edited = message("密钥：synthetic-new\n第 2 页");
-        let peer = edited.peer_ref().await.unwrap().unwrap();
-        let (tx, mut rx) = broadcast::channel(4);
-        drop(tx);
-        let received = wait_page(
-            &History(Mutex::new(vec![edited])),
-            &mut rx,
-            peer,
-            old.id(),
-            Some(&old),
-            5,
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(received.text().contains("synthetic-new"));
-    }
-
-    #[tokio::test]
-    async fn empty_result_is_terminal_and_cancellation_interrupts_history_wait() {
-        let empty = message("🔎 搜索词：synthetic\n🔍 未找到相关结果");
-        let peer = empty.peer_ref().await.unwrap().unwrap();
-        let (tx, mut rx) = broadcast::channel(4);
-        drop(tx);
-        let received = wait_page(
-            &History(Mutex::new(vec![empty])),
-            &mut rx,
-            peer,
-            10,
-            None,
-            5,
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(parser::no_search_results(received.text()));
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-        let error = wait_page(
-            &History(Mutex::new(vec![])),
-            &mut rx,
-            peer,
-            10,
-            None,
-            5,
-            &cancel,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.to_string(), "cancelled");
-    }
-}
+#[path = "search_tests.rs"]
+pub(crate) mod tests;

@@ -243,7 +243,7 @@ impl Store {
         self.call(move |c| {
             let tx=c.transaction()?;
             let state: String=tx.query_row("SELECT status FROM jobs WHERE id=?1", [&id], |r|r.get(0))?;
-            anyhow::ensure!(["failed","cancelled","interrupted","review"].contains(&state.as_str()), "job_not_retryable");
+            anyhow::ensure!(["failed","cancelled","interrupted","review","partial"].contains(&state.as_str()), "job_not_retryable");
             let uncertain: u32=tx.query_row("SELECT count(*) FROM transfers WHERE job_id=?1 AND status='sending'", [&id], |r|r.get(0))?;
             anyhow::ensure!(uncertain==0 || allow_uncertain, "transfer_uncertain");
             if allow_uncertain { tx.execute("DELETE FROM transfers WHERE job_id=?1 AND status='sending'", [&id])?; }
@@ -287,7 +287,9 @@ impl Store {
         }
         self.call(move |c| {
             let tx=c.transaction()?;
-            tx.execute("INSERT INTO batches VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET page=MAX(page,excluded.page),result_msg_id=COALESCE(excluded.result_msg_id,result_msg_id),updated_at=excluded.updated_at", params![id,keyword,page,message_id,unix_time()])?;
+            // Keep cursor page and message from the same search response. A fresh
+            // search may stop earlier; merged entries keep their stable sequences.
+            tx.execute("INSERT INTO batches VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET page=CASE WHEN excluded.result_msg_id IS NULL AND batches.result_msg_id IS NOT NULL THEN batches.page ELSE excluded.page END,result_msg_id=COALESCE(excluded.result_msg_id,batches.result_msg_id),updated_at=excluded.updated_at", params![id,keyword,page,message_id,unix_time()])?;
             let mut seq:u32=tx.query_row("SELECT COALESCE(MAX(seq),0) FROM entries WHERE batch_id=?1", [&id], |r|r.get(0))?;
             for (hash,body) in rows {
                 let inserted=tx.execute("INSERT OR IGNORE INTO entries VALUES(?1,?2,?3,?4)", params![id,seq+1,hash,body])?;

@@ -34,6 +34,17 @@ tokio::task_local! {
     static FLOOD_BUDGETS: Vec<watch::Sender<Duration>>;
 }
 
+pub(crate) fn flood_waited() -> Duration {
+    FLOOD_BUDGETS
+        .try_with(|budgets| {
+            budgets
+                .last()
+                .map(|budget| *budget.borrow())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
 struct PythonFloodSleep;
 impl RetryPolicy for PythonFloodSleep {
     fn should_retry(&self, ctx: &RetryContext) -> ControlFlow<(), Duration> {
