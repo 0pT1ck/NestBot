@@ -75,6 +75,7 @@ impl ClaimRecord {
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct JobReport {
     pub pages: u32,
     pub files: u32,
@@ -83,6 +84,9 @@ pub struct JobReport {
     pub skipped_keys: u32,
     pub skipped_files: u32,
     pub warnings: Vec<String>,
+    pub search_retry: u32,
+    pub search_retry_at: Option<i64>,
+    pub search_page: Option<u32>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

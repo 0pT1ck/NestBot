@@ -772,11 +772,20 @@ pub async fn command(
         "/status"=>{
             let (current,queued)=app.store.call(|c| {
                 let mut statement=c.prepare("SELECT id,kind,phase,completed,total FROM jobs WHERE status IN ('running','cancelling') AND kind!='incoming_copy' ORDER BY rowid")?;
-                let current=statement.query_map([],|r|Ok(format!("{} {} {} {}/{}",r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,u64>(3)?,r.get::<_,Option<u64>>(4)?.map(|n|n.to_string()).unwrap_or_else(||"?".into()))))?.collect::<Result<Vec<_>,_>>()?;
+                let current=statement.query_map([],|r|Ok((r.get::<_,String>(0)?,format!("{} {} {} {}/{}",r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,u64>(3)?,r.get::<_,Option<u64>>(4)?.map(|n|n.to_string()).unwrap_or_else(||"?".into())))))?.collect::<Result<Vec<_>,_>>()?;
                 let queued=c.query_row("SELECT count(*) FROM jobs WHERE status IN ('queued','waiting','interrupted') AND kind!='incoming_copy'",[],|r|r.get::<_,u32>(0))?;
                 Ok((current,queued))
             }).await?;
-            Ok(format!("任务：{}\n队列：{queued} 个等待\n处理方式：{}\n目标：{}",if current.is_empty(){"空闲".into()}else{current.join("\n")},app.mode().await?.as_str(),app.target().await?))
+            let mut lines=Vec::with_capacity(current.len());
+            for (id,mut line) in current {
+                let report=app.store.report(&id).await?;
+                if report.search_retry>0 {
+                    let wait=report.search_retry_at.map(|at|(at-crate::domain::unix_time()).max(0));
+                    line.push_str(&format!("\n搜索重试：第 {}/20 轮，已保存 {} 页；{}",report.search_retry,report.pages,wait.map(|seconds|format!("约 {seconds} 秒后点击原消息的下一页")).unwrap_or_else(||"正在点击并等待新回复".into())));
+                }
+                lines.push(line);
+            }
+            Ok(format!("任务：{}\n队列：{queued} 个等待\n处理方式：{}\n目标：{}",if lines.is_empty(){"空闲".into()}else{lines.join("\n")},app.mode().await?.as_str(),app.target().await?))
         },
         "/stop"=>{
             let active=app.store.call(|c| {use rusqlite::OptionalExtension;Ok(c.query_row("SELECT id FROM jobs WHERE status='running' AND kind!='incoming_copy' ORDER BY rowid LIMIT 1",[],|r|r.get::<_,String>(0)).optional()?)}).await?;

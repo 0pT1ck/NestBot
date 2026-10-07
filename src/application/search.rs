@@ -19,6 +19,65 @@ trait PageHistory: Sync {
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<Message>>> + Send;
 }
 
+trait PageSource: PageHistory {
+    fn click(
+        &self,
+        peer: PeerRef,
+        message: &Message,
+        data: Vec<u8>,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<String>>> + Send;
+}
+
+impl PageSource for Account {
+    async fn click(
+        &self,
+        peer: PeerRef,
+        message: &Message,
+        data: Vec<u8>,
+    ) -> anyhow::Result<Option<String>> {
+        Account::click(self, peer, message, data).await
+    }
+}
+
+struct PageInbox {
+    receiver: broadcast::Receiver<Message>,
+    seen: std::collections::BTreeMap<i32, Message>,
+}
+impl PageInbox {
+    fn new(receiver: broadcast::Receiver<Message>) -> Self {
+        Self {
+            receiver,
+            seen: Default::default(),
+        }
+    }
+    fn remember(&mut self, message: &Message) -> bool {
+        if self.seen.get(&message.id()).is_some_and(|old| {
+            old.raw == message.raw
+                || old
+                    .edit_date()
+                    .zip(message.edit_date())
+                    .is_some_and(|(old, new)| new < old)
+        }) {
+            return false;
+        }
+        self.seen.insert(message.id(), message.clone());
+        while self.seen.len() > 128 {
+            self.seen.pop_first();
+        }
+        true
+    }
+    fn accept(&mut self, message: &Message, mode: PageMode<'_>) -> anyhow::Result<bool> {
+        let fresh = self.remember(message);
+        // A page received during the retry wait remains usable even if the wait
+        // timer fired before the edit-settling window finished. Old error notices
+        // cannot re-enter the retry loop.
+        let state = page_ready(message, mode)?;
+        Ok(fresh
+            || state == PageState::End
+            || (state == PageState::Ready && !parse(message).entries.is_empty()))
+    }
+}
+
 impl PageHistory for Account {
     async fn poll(
         &self,
@@ -153,7 +212,7 @@ fn resume_start(cursor: Option<(u32, Option<i32>)>, reused: bool, reply: &Messag
 
 async fn wait_page(
     account: &impl PageHistory,
-    receiver: &mut broadcast::Receiver<Message>,
+    receiver: &mut PageInbox,
     peer: PeerRef,
     after: i32,
     mode: PageMode<'_>,
@@ -170,7 +229,7 @@ async fn wait_page(
 
 async fn wait_page_inner(
     account: &impl PageHistory,
-    receiver: &mut broadcast::Receiver<Message>,
+    receiver: &mut PageInbox,
     peer: PeerRef,
     after: i32,
     mode: PageMode<'_>,
@@ -217,10 +276,11 @@ async fn wait_page_inner(
         tokio::select! {
             _=cancel.cancelled()=>anyhow::bail!("cancelled"),
             result=tokio::time::timeout(remaining.min(candidate.as_ref().map(|(_,_,changed)| Duration::from_millis(800).saturating_sub(changed.elapsed())).unwrap_or(Duration::from_secs(3))),async {
-                if updates_open {receiver.recv().await} else {std::future::pending().await}
+                if updates_open {receiver.receiver.recv().await} else {std::future::pending().await}
             })=>{
                 match result {
                     Ok(Ok(message)) if message.peer_id()==peer.id && !message.outgoing() && (message.id()>after || previous.is_some_and(|p|p.id()==message.id()))=>{
+                        if !receiver.accept(&message,mode)? { continue; }
                         let first_reply = seen.is_empty();
                         if previous.is_some_and(|p| p.raw != message.raw) && parse(&message).entries.is_empty() { notice=Some(message.clone()); }
                         if observe(&mut seen, &mut best, &message) {
@@ -253,6 +313,7 @@ async fn wait_page_inner(
                     },
                 };
                 for message in messages {
+                    if !receiver.accept(&message,mode)? { continue; }
                     let first_reply = seen.is_empty();
                     if previous.is_some_and(|p| p.raw != message.raw) && parse(&message).entries.is_empty() { notice=Some(message.clone()); }
                     if observe(&mut seen, &mut best, &message) {
@@ -322,6 +383,9 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let mut report = app.store.report(&job.summary.id).await?;
     report.pages = 0;
+    report.search_retry = 0;
+    report.search_retry_at = None;
+    report.search_page = None;
     report
         .warnings
         .retain(|warning| !warning.starts_with("search_"));
@@ -339,7 +403,7 @@ pub async fn run(
     } else {
         None
     };
-    let mut receiver = account.messages.subscribe();
+    let mut receiver = PageInbox::new(account.messages.subscribe());
     let mut reply = None;
     if let Some((_, Some(message_id))) = cursor {
         reply = bounded(cancel, timeout, async {
@@ -454,6 +518,146 @@ pub async fn run(
     // Older databases could pair the maximum saved page with a newer search's
     // earlier message. Trust the actual reused message when it has a page label.
     let minimum = resume_start(cursor, reused, &reply);
+    paginate(
+        app,
+        job,
+        account.as_ref(),
+        &mut receiver,
+        peer,
+        reply,
+        Pagination {
+            keyword,
+            pages,
+            minimum,
+            reused,
+        },
+        cancel,
+    )
+    .await
+}
+
+struct Pagination<'a> {
+    keyword: &'a str,
+    pages: Option<u32>,
+    minimum: u32,
+    reused: bool,
+}
+
+const SEARCH_RETRY_LIMIT: u32 = 20;
+const SEARCH_RETRY_SECONDS: u64 = 60;
+
+enum RetryWake {
+    Retry,
+    Page(Box<Message>),
+    End,
+}
+
+async fn refresh_retry(
+    account: &impl PageHistory,
+    receiver: &mut PageInbox,
+    peer: PeerRef,
+    previous: &Message,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Option<RetryWake>> {
+    let messages = match bounded(
+        cancel,
+        10,
+        account.poll(peer, previous.id(), Some(previous.id())),
+    )
+    .await
+    {
+        Ok(messages) => messages,
+        Err(error) if cancel.is_cancelled() || error.downcast_ref::<RetryLater>().is_some() => {
+            return Err(error);
+        }
+        Err(_) => return Ok(None),
+    };
+    let mut candidate = None;
+    for message in messages {
+        if !receiver.accept(&message, PageMode::Next(previous))? {
+            continue;
+        }
+        match page_ready(&message, PageMode::Next(previous))? {
+            PageState::End => return Ok(Some(RetryWake::End)),
+            PageState::Ready if !parse(&message).entries.is_empty() => {
+                settle(&mut candidate, message, PageState::Ready)
+            }
+            _ => {}
+        }
+    }
+    Ok(candidate.map(|(message, _, _)| RetryWake::Page(Box::new(message))))
+}
+
+async fn wait_retry(
+    account: &impl PageHistory,
+    receiver: &mut PageInbox,
+    peer: PeerRef,
+    previous: &Message,
+    cancel: &CancellationToken,
+) -> anyhow::Result<RetryWake> {
+    let deadline = Instant::now() + Duration::from_secs(SEARCH_RETRY_SECONDS);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(RetryWake::Retry);
+        }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => anyhow::bail!("cancelled"),
+            _ = tokio::time::sleep_until(deadline) => return Ok(RetryWake::Retry),
+            result = wait_page(account,receiver,peer,previous.id(),PageMode::Next(previous),remaining.as_secs().max(1),cancel) => {
+                match result {
+                    Ok(Some(message)) if !parse(&message).entries.is_empty() => return Ok(RetryWake::Page(Box::new(message))),
+                    Ok(None) => return Ok(RetryWake::End),
+                    Err(error) if cancel.is_cancelled() || error.downcast_ref::<RetryLater>().is_some() => return Err(error),
+                    _ => {},
+                }
+            }
+        }
+    }
+}
+
+async fn notify(
+    app: &App,
+    job: &Job,
+    text: &str,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
+    if let Some(chat) = job.reply_chat {
+        bounded(cancel, 10, async {
+            crate::interfaces::bot::send(app, chat, text).await;
+            Ok(())
+        })
+        .await
+        .or_else(|error| {
+            if cancel.is_cancelled() {
+                Err(error)
+            } else {
+                Ok(())
+            }
+        })?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn paginate(
+    app: &App,
+    job: &Job,
+    account: &impl PageSource,
+    receiver: &mut PageInbox,
+    peer: PeerRef,
+    mut reply: Message,
+    options: Pagination<'_>,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
+    let timeout = app.config.limits.request_timeout_secs;
+    let Pagination {
+        keyword,
+        pages,
+        minimum,
+        reused,
+    } = options;
     let mut collected = 0u32;
     let mut first = reused;
     let mut retries = 0;
@@ -483,8 +687,21 @@ pub async fn run(
                     .await?;
                 collected += 1;
                 let mut report = app.store.report(&job.summary.id).await?;
+                let recovered = report.search_retry > 0;
                 report.pages = collected;
+                report.search_page = Some(current);
+                report.search_retry = 0;
+                report.search_retry_at = None;
                 app.store.save_report(&job.summary.id, &report).await?;
+                if recovered {
+                    notify(
+                        app,
+                        job,
+                        &format!("搜索已恢复：已保存第 {current} 页，继续翻页。"),
+                        cancel,
+                    )
+                    .await?;
+                }
                 app.progress(
                     &job.summary.id,
                     "search",
@@ -506,6 +723,32 @@ pub async fn run(
             Ok(())
         })
         .await?;
+        if retries > 0 {
+            match refresh_retry(account, receiver, peer, &reply, cancel).await? {
+                Some(RetryWake::Page(next)) => {
+                    reply = *next;
+                    retries = 0;
+                    first = false;
+                    continue;
+                }
+                Some(RetryWake::End) => break,
+                _ => {}
+            }
+        }
+        if retries > 0 {
+            let mut report = app.store.report(&job.summary.id).await?;
+            report.search_retry_at = None;
+            app.store.save_report(&job.summary.id, &report).await?;
+            app.progress(
+                &job.summary.id,
+                "search_retrying",
+                collected as u64,
+                pages.map(u64::from),
+            )
+            .await?;
+            notify(app,job,&format!("正在使用原消息的“下一页”按钮重试（第 {retries}/{SEARCH_RETRY_LIMIT} 轮，已保存 {collected} 页）。"),cancel).await?;
+        }
+        tracing::info!(event="search_next_click",job_id=%job.summary.id,message_id=reply.id(),page=parse(&reply).page,retry=retries);
         let answer = match bounded(cancel, timeout, account.click(peer, &reply, data)).await {
             Ok(answer) => answer,
             Err(error) if error.downcast_ref::<RetryLater>().is_some() => return Err(error),
@@ -524,8 +767,8 @@ pub async fn run(
             Some(reply.clone())
         } else {
             match wait_page(
-                account.as_ref(),
-                &mut receiver,
+                account,
+                receiver,
                 peer,
                 reply.id(),
                 PageMode::Next(&reply),
@@ -551,7 +794,7 @@ pub async fn run(
         };
         if parse(&next).entries.is_empty() || next.raw == reply.raw {
             retries += 1;
-            if retries > 20 {
+            if retries > SEARCH_RETRY_LIMIT {
                 app.store
                     .warning(&job.summary.id, "search_retries_exhausted")
                     .await?;
@@ -564,12 +807,21 @@ pub async fn run(
                 pages.map(u64::from),
             )
             .await?;
-            bounded(cancel, 61, async {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                Ok(())
-            })
-            .await?;
+            let mut report = app.store.report(&job.summary.id).await?;
+            report.search_retry = retries;
+            report.search_retry_at = Some(crate::domain::unix_time() + SEARCH_RETRY_SECONDS as i64);
+            app.store.save_report(&job.summary.id, &report).await?;
+            notify(app,job,&format!("搜索 Bot 暂时无法翻页，已保存 {collected} 页。{SEARCH_RETRY_SECONDS} 秒后自动重试原消息的“下一页”（第 {retries}/{SEARCH_RETRY_LIMIT} 轮）；可用 /status 查看，/stop 停止。"),cancel).await?;
             first = true;
+            match wait_retry(account, receiver, peer, &reply, cancel).await? {
+                RetryWake::Page(next) => {
+                    reply = *next;
+                    retries = 0;
+                    first = false;
+                }
+                RetryWake::End => break,
+                RetryWake::Retry => {}
+            }
             continue;
         }
         retries = 0;

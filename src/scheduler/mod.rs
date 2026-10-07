@@ -73,6 +73,20 @@ pub async fn worker(app: Arc<App>, fast: bool) -> anyhow::Result<()> {
                         "\n搜索未翻完，已收集结果保留。可用 /search {keyword} continue 续搜。"
                     ));
                 }
+                if report
+                    .warnings
+                    .iter()
+                    .any(|warning| warning == "search_page_stalled")
+                {
+                    progress.push_str("\n翻页等待超时，已停止本次搜索，已保存结果保留。");
+                }
+                if report
+                    .warnings
+                    .iter()
+                    .any(|warning| warning == "search_retries_exhausted")
+                {
+                    progress.push_str("\n连续 20 轮翻页未恢复，已停止自动重试。");
+                }
                 if job.summary.kind == "transfer" {
                     progress.push_str(&format!("\n成功 {} 个文件，续传/重复跳过 {} 个文件，已完成跳过 {} 个密钥；失败 {} 个密钥、{} 个文件。",report.files,report.skipped_files,report.skipped_keys,report.failed_keys,report.failed_files));
                 }
