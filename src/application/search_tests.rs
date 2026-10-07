@@ -630,6 +630,53 @@ fn resume_uses_reused_page_6_even_when_old_database_cursor_says_12() {
     let reply = message("密钥：synthetic-six\n第 6 页");
     assert_eq!(resume_start(Some((12, Some(reply.id()))), true, &reply), 7);
     assert_eq!(resume_start(Some((12, None)), false, &reply), 13);
+    let pending = message("密钥：synthetic-pending\n第 52 页");
+    assert_eq!(
+        resume_start(Some((51, Some(pending.id()))), true, &pending),
+        52
+    );
+    assert!(!reused_page_saved(Some((51, Some(pending.id()))), &pending));
+}
+
+#[tokio::test(start_paused = true)]
+async fn resume_saves_visible_page_52_when_only_51_was_committed_without_clicking_ahead() {
+    let (_dir, app) = retry_fixture();
+    let job = retry_job(&app).await;
+    let pending = result_page(52);
+    let peer = pending.peer_ref().await.unwrap().unwrap();
+    let (tx, rx) = broadcast::channel(4);
+    let state = Arc::new(Mutex::new(RetryState {
+        visible: pending.clone(),
+        notice: None,
+        clicks: vec![],
+    }));
+    let source = RetryBot {
+        mode: ErrorMode::New,
+        state: state.clone(),
+        tx,
+    };
+    let cursor = Some((51, Some(pending.id())));
+    let options = Pagination {
+        keyword: "synthetic",
+        pages: Some(1),
+        minimum: resume_start(cursor, true, &pending),
+        reused: reused_page_saved(cursor, &pending),
+    };
+    paginate(
+        &app,
+        &job,
+        &source,
+        &mut PageInbox::new(rx),
+        peer,
+        pending,
+        options,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(state.lock().unwrap().clicks.is_empty());
+    assert_eq!(app.store.cursor("synthetic").await.unwrap().unwrap().0, 52);
+    assert_eq!(app.store.report(&job.summary.id).await.unwrap().pages, 1);
 }
 
 #[tokio::test(start_paused = true)]

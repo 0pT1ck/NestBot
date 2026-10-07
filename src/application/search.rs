@@ -202,12 +202,27 @@ fn settle(
 }
 
 fn resume_start(cursor: Option<(u32, Option<i32>)>, reused: bool, reply: &Message) -> u32 {
+    if reused
+        && let Some((saved, _)) = cursor
+        && parse(reply).page.is_some_and(|current| current > saved)
+    {
+        // The bot may have advanced while the task was waiting or cancelled.
+        // That visible page has not been committed yet and must be collected.
+        return saved + 1;
+    }
     let page = if reused {
         parse(reply).page.or(cursor.map(|(page, _)| page))
     } else {
         cursor.map(|(page, _)| page)
     };
     page.map(|page| page + 1).unwrap_or(1)
+}
+
+fn reused_page_saved(cursor: Option<(u32, Option<i32>)>, reply: &Message) -> bool {
+    cursor
+        .map(|(saved, _)| saved)
+        .zip(parse(reply).page)
+        .is_none_or(|(saved, current)| current <= saved)
 }
 
 async fn wait_page(
@@ -518,6 +533,7 @@ pub async fn run(
     // Older databases could pair the maximum saved page with a newer search's
     // earlier message. Trust the actual reused message when it has a page label.
     let minimum = resume_start(cursor, reused, &reply);
+    let skip_first = reused && reused_page_saved(cursor, &reply);
     paginate(
         app,
         job,
@@ -529,7 +545,7 @@ pub async fn run(
             keyword,
             pages,
             minimum,
-            reused,
+            reused: skip_first,
         },
         cancel,
     )
