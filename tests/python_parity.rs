@@ -202,6 +202,178 @@ async fn legacy_completion_is_read_and_reopened_when_expected_count_grows() {
     assert_eq!(store.claim_record(payload).await.unwrap().files, 3);
 }
 
+#[test]
+fn legacy_claim_ids_are_distinct_without_overwriting_completion_metadata() {
+    let mut record: ClaimRecord = serde_json::from_value(json!({
+        "status": "done",
+        "files": 17,
+        "failed": 3,
+        "file_ids": [
+            ["document", 42], ["document", 42], ["photo", 42],
+            ["document", -42], ["custom:kind", 7], ["", 0]
+        ]
+    }))
+    .unwrap();
+    assert_eq!(record.file_ids.len(), 5);
+    assert_eq!(record.files, 17);
+    assert_eq!(record.failed, 3);
+    assert!(record.complete(Some(17)));
+    for media in [
+        "document:42",
+        "photo:42",
+        "document:-42",
+        "custom:kind:7",
+        ":0",
+    ] {
+        assert!(record.contains(media), "{media}");
+    }
+    assert!(!record.contains("video:42"));
+    record.add("document:42");
+    record.add("document:042");
+    record.add("document:+42");
+    assert_eq!(record.file_ids.len(), 5);
+    assert_eq!(record.files, 17);
+    record.add("video:42");
+    assert_eq!(record.file_ids.len(), 6);
+    assert_eq!(record.files, 6);
+    assert!(record.contains("video:42"));
+    assert_eq!(record.status, "done");
+    assert_eq!(record.failed, 3);
+
+    let rewritten = serde_json::to_value(&record).unwrap();
+    // Check the legacy pair-array shape and set contents, never traversal order.
+    let pairs: std::collections::BTreeSet<(String, i64)> =
+        serde_json::from_value(rewritten["file_ids"].clone()).unwrap();
+    assert_eq!(
+        pairs,
+        [
+            ("document".into(), 42),
+            ("photo".into(), 42),
+            ("document".into(), -42),
+            ("custom:kind".into(), 7),
+            ("".into(), 0),
+            ("video".into(), 42)
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert_eq!(rewritten["file_ids"].as_array().unwrap().len(), 6);
+    let restored: ClaimRecord = serde_json::from_value(rewritten).unwrap();
+    assert_eq!(restored.files, 6);
+    assert_eq!(restored.failed, 3);
+    assert_eq!(restored.status, "done");
+    assert_eq!(restored.file_ids.len(), 6);
+    for media in [
+        "document:42",
+        "photo:42",
+        "document:-42",
+        "custom:kind:7",
+        ":0",
+        "video:42",
+    ] {
+        assert!(restored.contains(media), "{media}");
+    }
+}
+
+#[test]
+fn claim_media_parsing_preserves_boundaries_and_missing_field_defaults() {
+    let mut record: ClaimRecord = serde_json::from_value(json!({"status": "partial"})).unwrap();
+    assert!(record.file_ids.is_empty());
+    assert_eq!(record.files, 0);
+    assert_eq!(record.failed, 0);
+    for media in [
+        "missing-colon",
+        "document:",
+        "document:abc",
+        "document: 1",
+        "document:1:2",
+        "document:9223372036854775808",
+    ] {
+        assert!(!record.contains(media), "{media}");
+        record.add(media);
+    }
+    assert!(record.file_ids.is_empty());
+    record.add("document:01");
+    record.add("document:+1");
+    record.add("document:-0");
+    record.add("document:-9223372036854775808");
+    record.add("document:9223372036854775807");
+    assert_eq!(record.files, 4);
+    for media in [
+        "document:1",
+        "document:0",
+        "document:-9223372036854775808",
+        "document:9223372036854775807",
+    ] {
+        assert!(record.contains(media), "{media}");
+    }
+    for media in ["document:01", "document:+1", "document:-0", "document:-01"] {
+        assert!(!record.contains(media), "{media}");
+    }
+    for ids in [
+        json!(null),
+        json!({}),
+        json!([["d"]]),
+        json!([["d", "1"]]),
+        json!([["d", 1, 2]]),
+    ] {
+        assert!(
+            serde_json::from_value::<ClaimRecord>(json!({"status": "done", "file_ids": ids}))
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn encrypted_legacy_claim_duplicates_rewrite_as_unique_pairs() {
+    use sha2::{Digest, Sha256};
+    let (_dir, store) = fixture();
+    let payload = "synthetic-duplicate-progress";
+    let id = format!("{:x}", Sha256::digest(payload.as_bytes()))[..32].to_string();
+    let body = store
+        .vault
+        .encrypt(
+            &format!("legacy:{id}"),
+            br#"{"status":"done","files":9,"failed":2,"file_ids":[["document",42],["document",42],["photo",42],["document",-42]]}"#,
+        )
+        .unwrap();
+    store
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO legacy_claims VALUES(?1,?2)",
+                rusqlite::params![id, body],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let mut record = store.claim_record(payload).await.unwrap();
+    assert_eq!(record.files, 9);
+    assert_eq!(record.failed, 2);
+    assert_eq!(record.file_ids.len(), 3);
+    for media in ["document:42", "photo:42", "document:-42"] {
+        assert!(record.contains(media), "{media}");
+    }
+    record.add("document:42");
+    assert_eq!(record.files, 9);
+    store.save_claim(payload, &record).await.unwrap();
+    let mut restored = store.claim_record(payload).await.unwrap();
+    assert_eq!(restored.files, 9);
+    assert_eq!(restored.failed, 2);
+    assert_eq!(restored.file_ids.len(), 3);
+    for media in ["document:42", "photo:42", "document:-42"] {
+        assert!(restored.contains(media), "{media}");
+    }
+    restored.add("video:42");
+    assert_eq!(restored.files, 4);
+    store.save_claim(payload, &restored).await.unwrap();
+    let restored = store.claim_record(payload).await.unwrap();
+    assert_eq!(restored.files, 4);
+    assert_eq!(restored.failed, 2);
+    assert!(restored.complete(Some(4)));
+    assert!(restored.contains("video:42"));
+}
+
 fn transfer(keys: Vec<String>) -> JobPayload {
     JobPayload::Transfer {
         options: Default::default(),

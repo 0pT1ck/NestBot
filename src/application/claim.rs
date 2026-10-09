@@ -14,7 +14,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 struct Collector {
-    task: tokio::task::JoinHandle<anyhow::Result<u32>>,
+    task: tokio::task::JoinHandle<anyhow::Result<Collected>>,
     stop: CancellationToken,
 }
 
@@ -26,6 +26,30 @@ impl std::fmt::Display for BotRateLimit {
     }
 }
 impl std::error::Error for BotRateLimit {}
+
+struct Collected {
+    count: u32,
+    limited: Option<u64>,
+}
+
+fn collected_error(count: u32, error: anyhow::Error) -> anyhow::Result<Collected> {
+    if let Some(limit) = error.downcast_ref::<RetryLater>() {
+        Ok(Collected {
+            count,
+            limited: Some(limit.seconds),
+        })
+    } else {
+        Err(error)
+    }
+}
+
+fn extraction_error(error: anyhow::Error) -> anyhow::Error {
+    if let Some(limit) = error.downcast_ref::<RetryLater>() {
+        BotRateLimit(limit.seconds).into()
+    } else {
+        error
+    }
+}
 
 #[derive(Default)]
 struct ClaimStats {
@@ -147,7 +171,7 @@ async fn collect(
     request_timeout: u64,
     cancel: CancellationToken,
     mut receiver: tokio::sync::broadcast::Receiver<grammers_client::message::Message>,
-) -> anyhow::Result<u32> {
+) -> anyhow::Result<Collected> {
     let clock = crate::telegram::ActiveClock::new();
     let mut deadline = Duration::from_secs(timeout);
     let mut initial_batch = true;
@@ -177,7 +201,7 @@ async fn collect(
         match event {
             Some(Ok(message)) => messages.push(message),
             None | Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
-                let scan = account
+                let scan = match account
                     .scan(
                         &store,
                         &job,
@@ -187,7 +211,11 @@ async fn collect(
                         &cancel,
                         request_timeout,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(scan) => scan,
+                    Err(error) => return collected_error(count, error),
+                };
                 last_id = scan.newest;
                 if scan.inserted > 0 {
                     count += scan.inserted;
@@ -223,8 +251,7 @@ async fn collect(
                     seen.remove(&id);
                 }
             }
-            if count == 0
-                && message.media().is_none()
+            if message.media().is_none()
                 && let Some(seconds) = parser::claim_rate_wait(message.text())
             {
                 limited = Some(seconds);
@@ -251,6 +278,12 @@ async fn collect(
                 saw_reply = true;
             }
         }
+        if let Some(seconds) = limited {
+            return Ok(Collected {
+                count,
+                limited: Some(seconds),
+            });
+        }
         if saw_reply && expected.is_some_and(|expected| count >= expected) {
             break;
         }
@@ -258,7 +291,20 @@ async fn collect(
         // edit the label while reusing exactly the same callback bytes.
         let ids = navigation.keys().copied().collect::<Vec<_>>();
         if !ids.is_empty() && clock.elapsed().saturating_sub(last) >= Duration::from_secs(3) {
-            for message in bounded(&cancel, request_timeout, account.refresh(peer, &ids)).await? {
+            let refreshed =
+                match bounded(&cancel, request_timeout, account.refresh(peer, &ids)).await {
+                    Ok(messages) => messages,
+                    Err(error) => return collected_error(count, error),
+                };
+            for message in refreshed {
+                if message.media().is_none()
+                    && let Some(seconds) = parser::claim_rate_wait(message.text())
+                {
+                    return Ok(Collected {
+                        count,
+                        limited: Some(seconds),
+                    });
+                }
                 if let Some((label, data)) =
                     parser::callback_button(&message, &["全部获取", "查看下一组", "下一组"])
                 {
@@ -296,11 +342,22 @@ async fn collect(
                     account.click(peer, &message, data.clone()),
                 )
                 .await;
-                if let Err(error) = result {
-                    if cancel.is_cancelled() || error.downcast_ref::<RetryLater>().is_some() {
-                        return Err(error);
+                match result {
+                    Ok(Some(answer)) => {
+                        if let Some(seconds) = parser::claim_rate_wait(&answer) {
+                            return Ok(Collected {
+                                count,
+                                limited: Some(seconds),
+                            });
+                        }
                     }
-                    break;
+                    Ok(None) => {}
+                    Err(error) => {
+                        if cancel.is_cancelled() || error.downcast_ref::<RetryLater>().is_some() {
+                            return collected_error(count, error);
+                        }
+                        break;
+                    }
                 }
                 clicked.insert(message.id(), label);
                 last = clock.elapsed();
@@ -313,21 +370,21 @@ async fn collect(
                 ));
                 continue;
             }
-            if count == 0
-                && let Some(seconds) = limited
-            {
-                return Err(BotRateLimit(seconds).into());
-            }
             break;
         }
     }
-    Ok(count)
+    Ok(Collected {
+        count,
+        limited: None,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn once(
     app: &App,
     job: &Job,
+    account: Arc<Account>,
+    record: &mut ClaimRecord,
     payload: &str,
     expected: Option<u32>,
     mode: TransferMode,
@@ -336,23 +393,18 @@ async fn once(
     dry: bool,
     batch: Option<(&str, u32)>,
     cancel: &CancellationToken,
-) -> anyhow::Result<ClaimStats> {
-    let mut record = if redo {
-        ClaimRecord::default()
-    } else {
-        app.store.claim_record(payload).await?
-    };
-    let account = app.users.account(false, cancel).await?;
+) -> anyhow::Result<(ClaimStats, Option<u64>)> {
     let sender = app.users.sender(cancel).await?;
     let timeout = app.config.limits.request_timeout_secs;
-    let peer = bounded(
+    let peer = crate::telegram::extraction_scope(bounded(
         cancel,
         timeout,
         account.resolve(&app.config.telegram.file_bot),
-    )
-    .await?;
+    ))
+    .await
+    .map_err(extraction_error)?;
     let destination = bounded(cancel, timeout, sender.resolve(target)).await?;
-    let identity = bounded(cancel, timeout, async {
+    let identity = crate::telegram::extraction_scope(bounded(cancel, timeout, async {
         Ok(account
             .client
             .get_me()
@@ -360,43 +412,52 @@ async fn once(
             .map_err(rpc)?
             .id()
             .bot_api_dialog_id_unchecked())
-    })
-    .await?;
-    let claim = app.store.vault.index("claim", payload);
+    }))
+    .await
+    .map_err(extraction_error)?;
+    // Private message IDs and album groups are local to the extraction account.
+    let claim = app
+        .store
+        .vault
+        .index("claim_inbox", &serde_json::to_string(&(identity, payload))?);
     let scope = app.store.vault.index(
         "transfer_scope",
         &serde_json::to_string(&(identity, target, mode.as_str(), payload))?,
     );
     app.store.reset_inbox(&job.summary.id, &claim).await?;
     let receiver = account.messages.subscribe();
-    let sent = bounded(cancel, timeout, async {
+    let sent = crate::telegram::extraction_scope(bounded(cancel, timeout, async {
         account
             .client
             .send_message(peer, format!("/start {payload}"))
             .await
             .map_err(rpc)
-    })
-    .await?;
+    }))
+    .await
+    .map_err(extraction_error)?;
     let stop = cancel.child_token();
-    let mut collector = Collector {
-        task: tokio::spawn(crate::telegram::inherit_flood_context(collect(
-            account.clone(),
-            app.store.clone(),
-            job.summary.id.clone(),
-            claim.clone(),
-            peer,
-            sent.id(),
-            expected,
-            app.config.limits.claim_timeout_secs,
-            timeout,
-            stop.clone(),
-            receiver,
-        ))),
-        stop,
-    };
+    let mut collector = crate::telegram::extraction_scope(async {
+        Collector {
+            task: tokio::spawn(crate::telegram::inherit_flood_context(collect(
+                account.clone(),
+                app.store.clone(),
+                job.summary.id.clone(),
+                claim.clone(),
+                peer,
+                sent.id(),
+                expected,
+                app.config.limits.claim_timeout_secs,
+                timeout,
+                stop.clone(),
+                receiver,
+            ))),
+            stop,
+        }
+    })
+    .await;
     let mut count = 0;
     let mut stats = ClaimStats::default();
-    let received = (&mut collector.task).await??;
+    let collected = (&mut collector.task).await??;
     loop {
         let ids = app.store.inbox_next(&job.summary.id, &claim).await?;
         if ids.is_empty() {
@@ -423,7 +484,7 @@ async fn once(
                     .transfer_status(&scope, &media)
                     .await?
                     .is_some_and(|(status, _)| status == "done");
-            let resumed = !redo && (record.contains(&media) || ledger_done);
+            let resumed = record.contains(&media) || ledger_done;
             let duplicate = app.store.media_seen(&job.summary.id, &media).await? || resumed;
             if duplicate {
                 stats.skipped += 1;
@@ -499,7 +560,7 @@ async fn once(
                         app.store.save_report(&job.summary.id, &report).await?;
                         record.add(&media);
                         record.status = "partial".into();
-                        app.store.save_claim(payload, &record).await?;
+                        app.store.save_claim(payload, record).await?;
                         app.store.mark_media_seen(&job.summary.id, &media).await?;
                         if let Some(owner) = job.reply_chat {
                             crate::interfaces::bot::remember_media(
@@ -531,6 +592,7 @@ async fn once(
                 report.files += 1;
                 app.store.save_report(&job.summary.id, &report).await?;
                 app.store.mark_media_seen(&job.summary.id, &media).await?;
+                record.add(&media);
             }
             app.store
                 .inbox_done(&job.summary.id, &claim, message.id())
@@ -545,24 +607,19 @@ async fn once(
             .await?;
         }
     }
-    stats.incomplete = received == 0
-        || expected.is_some_and(|n| {
-            if dry {
-                stats.files + stats.resumed < n
-            } else {
-                record.files < n
-            }
-        })
-        || count != received
+    stats.incomplete = collected.limited.is_some()
+        || collected.count == 0
+        || expected.is_some_and(|n| record.files < n)
+        || count != collected.count
         || stats.failed > 0;
     if !dry && (stats.files > 0 || stats.resumed > 0) {
         record.failed = stats.failed;
         record.status = if !stats.incomplete { "done" } else { "partial" }.into();
         app.store
-            .save_claim_for_batch(payload, &record, batch)
+            .save_claim_for_batch(payload, record, batch)
             .await?;
     }
-    Ok(stats)
+    Ok((stats, collected.limited))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -584,22 +641,62 @@ pub async fn run(
         app.store.save_report(&job.summary.id, &report).await?;
         return Ok(true);
     }
+    let mut record = if redo {
+        ClaimRecord::default()
+    } else {
+        app.store.claim_record(payload).await?
+    };
     loop {
-        match once(
-            app, job, payload, expected, mode, target, redo, dry, batch, cancel,
-        )
-        .await
-        {
+        let mut upload = false;
+        let result = async {
+            let (selected, account) = app.users.extraction_account(cancel).await?;
+            upload = selected;
+            once(
+                app,
+                job,
+                account,
+                &mut record,
+                payload,
+                expected,
+                mode,
+                target,
+                redo,
+                dry,
+                batch,
+                cancel,
+            )
+            .await
+        }
+        .await;
+        match result {
             Err(error) if error.downcast_ref::<BotRateLimit>().is_some() => {
                 let seconds = error.downcast_ref::<BotRateLimit>().unwrap().0.max(1);
                 app.progress(&job.summary.id, "claim_waiting", 0, expected.map(u64::from))
                     .await?;
-                crate::telegram::wait_flood(cancel, seconds).await?;
+                app.users.extraction_limited(upload, seconds).await?;
+            }
+            Ok((stats, Some(seconds))) => {
+                let mut report = app.store.report(&job.summary.id).await?;
+                report.skipped_files += stats.skipped;
+                report.failed_files += stats.failed;
+                app.store.save_report(&job.summary.id, &report).await?;
+                app.progress(&job.summary.id, "claim_waiting", 0, expected.map(u64::from))
+                    .await?;
+                app.users.extraction_limited(upload, seconds).await?;
+                if stats.failed > 0 {
+                    let mut report = app.store.report(&job.summary.id).await?;
+                    report.failed_keys += 1;
+                    if !report.warnings.iter().any(|s| s == "claim_incomplete") {
+                        report.warnings.push("claim_incomplete".into());
+                    }
+                    app.store.save_report(&job.summary.id, &report).await?;
+                    return Ok(false);
+                }
             }
             result => {
                 let mut report = app.store.report(&job.summary.id).await?;
                 let completed = match result {
-                    Ok(stats) => {
+                    Ok((stats, None)) => {
                         report.skipped_files += stats.skipped;
                         report.failed_files += stats.failed;
                         if stats.incomplete {
@@ -610,6 +707,7 @@ pub async fn run(
                         }
                         !stats.incomplete
                     }
+                    Ok((_, Some(_))) => unreachable!("limited attempts handled above"),
                     Err(error) => {
                         if cancel.is_cancelled()
                             || error.downcast_ref::<RetryLater>().is_some()

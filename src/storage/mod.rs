@@ -47,6 +47,7 @@ impl Store {
         connection.execute_batch(include_str!("../../migrations/001_initial.sql"))?;
         connection.execute_batch(include_str!("../../migrations/002_behavior.sql"))?;
         connection.execute_batch(include_str!("../../migrations/003_batch_progress.sql"))?;
+        connection.execute_batch(include_str!("../../migrations/004_resource_bounds.sql"))?;
         let grouped = connection
             .prepare("PRAGMA table_info(claim_inbox)")?
             .query_map([], |r| r.get::<_, String>(1))?
@@ -114,8 +115,16 @@ impl Store {
 
     pub async fn recover(&self) -> anyhow::Result<()> {
         self.call(|connection| {
-            connection.execute("UPDATE jobs SET status=CASE WHEN EXISTS(SELECT 1 FROM transfers WHERE transfers.job_id=jobs.id AND transfers.status='sending') THEN 'review' WHEN status='cancelling' THEN 'cancelled' ELSE 'queued' END,phase=CASE WHEN EXISTS(SELECT 1 FROM transfers WHERE transfers.job_id=jobs.id AND transfers.status='sending') THEN 'review' WHEN status='cancelling' THEN 'cancelled' ELSE 'recovered' END,retry_at=NULL,updated_at=?1 WHERE status IN ('running','cancelling','interrupted')", [unix_time()])?;
-            connection.execute("DELETE FROM bot_updates WHERE updated_at < ?1", [unix_time() - 7*86400])?;
+            let tx = connection.transaction()?;
+            let now = unix_time();
+            tx.execute("UPDATE jobs SET status=CASE WHEN EXISTS(SELECT 1 FROM transfers WHERE transfers.job_id=jobs.id AND transfers.status='sending') THEN 'review' WHEN status='cancelling' THEN 'cancelled' ELSE 'queued' END,phase=CASE WHEN EXISTS(SELECT 1 FROM transfers WHERE transfers.job_id=jobs.id AND transfers.status='sending') THEN 'review' WHEN status='cancelling' THEN 'cancelled' ELSE 'recovered' END,retry_at=NULL,updated_at=?1 WHERE status IN ('running','cancelling','interrupted')", [now])?;
+            // Historical completed jobs cannot be retried; all other dedupe state is durable.
+            // A sending transfer defensively preserves even a completed job's recovery state.
+            tx.execute("DELETE FROM claim_inbox WHERE job_id IN (SELECT id FROM jobs WHERE status='completed' AND NOT EXISTS(SELECT 1 FROM transfers WHERE transfers.job_id=jobs.id AND transfers.status='sending'))", [])?;
+            tx.execute("DELETE FROM job_media_seen WHERE job_id IN (SELECT id FROM jobs WHERE status='completed' AND NOT EXISTS(SELECT 1 FROM transfers WHERE transfers.job_id=jobs.id AND transfers.status='sending'))", [])?;
+            tx.execute("DELETE FROM bot_callbacks WHERE expires < ?1", [now])?;
+            tx.execute("DELETE FROM bot_updates WHERE updated_at < ?1", [now - 7 * 86400])?;
+            tx.commit()?;
             Ok(())
         }).await
     }
@@ -225,7 +234,19 @@ impl Store {
     ) -> anyhow::Result<()> {
         let (id, status, error) = (id.to_owned(), status.to_owned(), error.map(str::to_owned));
         self.call(move |c| {
-            c.execute("UPDATE jobs SET status=CASE WHEN status IN ('cancelled','cancelling') AND ?2!='review' THEN 'cancelled' ELSE ?2 END,phase=CASE WHEN status IN ('cancelled','cancelling') AND ?2!='review' THEN 'cancelled' ELSE ?2 END,error_code=CASE WHEN status IN ('cancelled','cancelling') AND ?2!='review' THEN NULL ELSE ?3 END,retry_at=CASE WHEN status IN ('cancelled','cancelling') THEN NULL ELSE ?4 END,updated_at=?5 WHERE id=?1", params![id,status,error,retry_at,unix_time()])?;
+            let tx = c.transaction()?;
+            tx.execute("UPDATE jobs SET status=CASE WHEN status IN ('cancelled','cancelling') AND ?2!='review' THEN 'cancelled' ELSE ?2 END,phase=CASE WHEN status IN ('cancelled','cancelling') AND ?2!='review' THEN 'cancelled' ELSE ?2 END,error_code=CASE WHEN status IN ('cancelled','cancelling') AND ?2!='review' THEN NULL ELSE ?3 END,retry_at=CASE WHEN status IN ('cancelled','cancelling') THEN NULL ELSE ?4 END,updated_at=?5 WHERE id=?1", params![id,status,error,retry_at,unix_time()])?;
+            // Read the persisted status: cancellation may have won the finish race.
+            let cleanup: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE id=?1 AND status='completed' AND NOT EXISTS(SELECT 1 FROM transfers WHERE job_id=?1 AND status='sending'))",
+                [&id],
+                |r| r.get(0),
+            )?;
+            if cleanup {
+                tx.execute("DELETE FROM claim_inbox WHERE job_id=?1", [&id])?;
+                tx.execute("DELETE FROM job_media_seen WHERE job_id=?1", [&id])?;
+            }
+            tx.commit()?;
             Ok(())
         }).await
     }

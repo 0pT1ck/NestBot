@@ -13,7 +13,20 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
       - run: cargo build --locked --release
-      - run: cp target/release/nestbot nestbot && tar -czf nestbot-linux-x86_64.tar.gz nestbot deploy config/secrets.example.env README.md docs
+      - name: Smoke directory-local launcher
+        run: |
+          cp target/release/nestbot nestbot
+          cp config/nestbot.example.toml config/nestbot.toml
+          cp config/secrets.example.env config/secrets.env
+          root="$PWD"
+          (
+            cd /tmp
+            "$root/deploy/run-local.sh" doctor
+            "$root/deploy/run-local.sh" init
+          )
+          test -f .local/data/nestbot.sqlite
+          test -f .local/data/master.key
+      - run: tar -czf nestbot-linux-x86_64.tar.gz nestbot deploy config/nestbot.example.toml config/secrets.example.env README.md docs
       - uses: actions/upload-artifact@v4
         with:
           name: nestbot-linux-x86_64

@@ -71,7 +71,8 @@ async fn collector_waits_823_seconds_then_saves_media_and_ends_after_normal_quie
     )
     .await
     .unwrap();
-    assert_eq!(count, 1);
+    assert_eq!(count.count, 1);
+    assert_eq!(count.limited, None);
     assert!(start.elapsed() >= Duration::from_secs(823));
     assert!(start.elapsed() < Duration::from_secs(840));
     assert!(
@@ -140,6 +141,7 @@ struct Replay {
     messages: Arc<Mutex<Vec<Message>>>,
     replies: Mutex<VecDeque<(u64, Vec<Message>)>>,
     clicks: Mutex<Vec<String>>,
+    answers: tokio::sync::Mutex<VecDeque<anyhow::Result<Option<String>>>>,
 }
 impl Replay {
     fn new(initial: Vec<Message>, replies: Vec<(u64, Vec<Message>)>) -> Arc<Self> {
@@ -147,6 +149,7 @@ impl Replay {
             messages: Arc::new(Mutex::new(initial)),
             replies: Mutex::new(replies.into()),
             clicks: Mutex::new(vec![]),
+            answers: tokio::sync::Mutex::new(VecDeque::new()),
         })
     }
 }
@@ -219,10 +222,20 @@ impl ClaimSource for Replay {
                 }
             });
         }
-        Ok(None)
+        self.answers.lock().await.pop_front().unwrap_or(Ok(None))
     }
 }
 async fn replay(source: Arc<Replay>, expected: Option<u32>) -> (u32, Store, tempfile::TempDir) {
+    let (collected, store, dir) = replay_attempt(source, expected, 300).await;
+    assert_eq!(collected.limited, None);
+    (collected.count, store, dir)
+}
+
+async fn replay_attempt(
+    source: Arc<Replay>,
+    expected: Option<u32>,
+    timeout: u64,
+) -> (Collected, Store, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let vault = Arc::new(
         crate::storage::vault::Vault::open(&dir.path().join("master.key"), "synthetic-password")
@@ -245,7 +258,7 @@ async fn replay(source: Arc<Replay>, expected: Option<u32>) -> (u32, Store, temp
         peer,
         0,
         expected,
-        300,
+        timeout,
         90,
         CancellationToken::new(),
         rx,
@@ -259,8 +272,8 @@ async fn replay(source: Arc<Replay>, expected: Option<u32>) -> (u32, Store, temp
         std::thread::sleep(Duration::from_millis(2));
         tokio::task::yield_now().await;
     }
-    let count = task.await.unwrap().unwrap();
-    (count, store, dir)
+    let collected = task.await.unwrap().unwrap();
+    (collected, store, dir)
 }
 
 #[tokio::test]
@@ -388,4 +401,153 @@ async fn python_click_without_a_reply_keeps_the_received_media() {
     let (count, _, _) = replay(source.clone(), Some(9)).await;
     assert_eq!(count, 1);
     assert_eq!(source.clicks.lock().unwrap().len(), 1);
+}
+
+fn restriction(id: i32, text: &str) -> Message {
+    let mut message = message(id, None, false);
+    let enums::Message::Message(raw) = &mut message.raw else {
+        panic!("expected message")
+    };
+    raw.message = text.into();
+    message
+}
+
+#[tokio::test]
+async fn bot_limit_before_media_surfaces_without_waiting_for_deadline() {
+    let source = Replay::new(vec![restriction(1, "请求频繁，请稍后60秒重试")], vec![]);
+    let started = Instant::now();
+    let (collected, store, _dir) = replay_attempt(source.clone(), Some(2), 300).await;
+    assert_eq!(collected.count, 0);
+    assert_eq!(collected.limited, Some(60));
+    assert!(started.elapsed() < Duration::from_secs(30));
+    assert!(source.clicks.lock().unwrap().is_empty());
+    assert!(
+        store
+            .inbox_next("synthetic-job", "synthetic-claim")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn bot_limit_while_awaiting_group_preserves_partial_inbox() {
+    let source = Replay::new(
+        vec![
+            message(1, None, true),
+            message(2, Some("下一组 (2/2)"), false),
+        ],
+        vec![(12, vec![restriction(3, "暂时限制，请稍后120秒重试")])],
+    );
+    let (collected, store, _dir) = replay_attempt(source.clone(), Some(2), 30).await;
+    assert_eq!(collected.count, 1);
+    assert_eq!(collected.limited, Some(120));
+    assert_eq!(
+        store
+            .inbox_next("synthetic-job", "synthetic-claim")
+            .await
+            .unwrap(),
+        vec![1]
+    );
+    assert_eq!(source.clicks.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn callback_answer_limit_preserves_partial_inbox() {
+    let source = Replay::new(
+        vec![
+            message(1, None, true),
+            message(2, Some("下一组 (2/2)"), false),
+        ],
+        vec![],
+    );
+    source
+        .answers
+        .lock()
+        .await
+        .push_back(Ok(Some("请求频繁，请稍后90秒重试".into())));
+    let (collected, store, _dir) = replay_attempt(source.clone(), Some(2), 300).await;
+    assert_eq!(collected.count, 1);
+    assert_eq!(collected.limited, Some(90));
+    assert_eq!(
+        store
+            .inbox_next("synthetic-job", "synthetic-claim")
+            .await
+            .unwrap(),
+        vec![1]
+    );
+    assert_eq!(source.clicks.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn callback_rpc_limit_preserves_partial_inbox() {
+    let source = Replay::new(
+        vec![
+            message(1, None, true),
+            message(2, Some("下一组 (2/2)"), false),
+        ],
+        vec![],
+    );
+    source
+        .answers
+        .lock()
+        .await
+        .push_back(Err(RetryLater { seconds: 75 }.into()));
+    let (collected, store, _dir) = replay_attempt(source, Some(2), 300).await;
+    assert_eq!(collected.count, 1);
+    assert_eq!(collected.limited, Some(75));
+    assert_eq!(
+        store
+            .inbox_next("synthetic-job", "synthetic-claim")
+            .await
+            .unwrap(),
+        vec![1]
+    );
+}
+
+#[tokio::test]
+async fn refreshed_navigation_limit_surfaces_while_awaiting_group() {
+    let source = Replay::new(
+        vec![
+            message(1, None, true),
+            message(2, Some("下一组 (2/2)"), false),
+        ],
+        vec![(0, vec![restriction(2, "暂时限制，请稍后45秒重试")])],
+    );
+    let (collected, store, _dir) = replay_attempt(source, Some(2), 30).await;
+    assert_eq!(collected.count, 1);
+    assert_eq!(collected.limited, Some(45));
+    assert_eq!(
+        store
+            .inbox_next("synthetic-job", "synthetic-claim")
+            .await
+            .unwrap(),
+        vec![1]
+    );
+}
+
+#[tokio::test]
+async fn nonlimit_callback_error_keeps_existing_partial_result() {
+    let source = Replay::new(
+        vec![
+            message(1, None, true),
+            message(2, Some("下一组 (2/2)"), false),
+        ],
+        vec![],
+    );
+    source
+        .answers
+        .lock()
+        .await
+        .push_back(Err(crate::telegram::TelegramRejected.into()));
+    let (collected, store, _dir) = replay_attempt(source, Some(2), 300).await;
+    assert_eq!(collected.count, 1);
+    assert_eq!(collected.limited, None);
+    assert_eq!(
+        store
+            .inbox_next("synthetic-job", "synthetic-claim")
+            .await
+            .unwrap(),
+        vec![1]
+    );
 }

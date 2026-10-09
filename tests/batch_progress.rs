@@ -101,7 +101,7 @@ async fn manual_progress_needs_no_target_is_exact_can_be_lowered_and_survives_re
                 status: "done".into(),
                 files: 1,
                 failed: 0,
-                file_ids: vec![("d".into(), 20)],
+                file_ids: [("d".into(), 20)].into_iter().collect(),
             },
         )
         .await
@@ -242,7 +242,7 @@ async fn final_claim_and_batch_completion_commit_atomically() {
         status: "done".into(),
         files: 1,
         failed: 0,
-        file_ids: vec![("d".into(), 1)],
+        file_ids: [("d".into(), 1)].into_iter().collect(),
     };
     store.call(|c| {c.execute_batch("CREATE TRIGGER reject_completion BEFORE DELETE ON batch_progress BEGIN SELECT RAISE(ABORT,'synthetic failure'); END;")?;Ok(())}).await.unwrap();
     assert!(

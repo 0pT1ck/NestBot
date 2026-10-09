@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -51,26 +52,124 @@ pub struct ClaimRecord {
     pub files: u32,
     #[serde(default)]
     pub failed: u32,
-    #[serde(default)]
-    pub file_ids: Vec<(String, i64)>,
+    #[serde(default, with = "media_ids_serde")]
+    pub file_ids: MediaIds,
 }
 impl ClaimRecord {
     pub fn complete(&self, expected: Option<u32>) -> bool {
         self.status == "done" && expected.is_none_or(|n| self.files >= n)
     }
     pub fn contains(&self, media: &str) -> bool {
+        let Some((kind, text)) = media.rsplit_once(':') else {
+            return false;
+        };
+        let Ok(id) = text.parse::<i64>() else {
+            return false;
+        };
+        // Match the canonical spelling previously produced by formatting the ID.
+        let digits = text.strip_prefix('-').unwrap_or(text);
+        if text.starts_with('+') || text == "-0" || (digits.len() > 1 && digits.starts_with('0')) {
+            return false;
+        }
         self.file_ids
-            .iter()
-            .any(|(kind, id)| media == format!("{kind}:{id}"))
+            .by_kind
+            .get(kind)
+            .is_some_and(|ids| ids.contains(&id))
     }
     pub fn add(&mut self, media: &str) {
-        if !self.contains(media)
-            && let Some((kind, id)) = media.split_once(':')
+        if let Some((kind, id)) = media.split_once(':')
             && let Ok(id) = id.parse()
+            && self.file_ids.insert(kind, id)
         {
-            self.file_ids.push((kind.into(), id));
             self.files = self.file_ids.len() as u32;
         }
+    }
+}
+
+/// Distinct media pairs; the count always equals the total set cardinality.
+/// ClaimRecord's `files` metadata remains independent until a new pair is added.
+#[derive(Clone, Default)]
+pub struct MediaIds {
+    by_kind: BTreeMap<String, BTreeSet<i64>>,
+    count: usize,
+}
+
+impl MediaIds {
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    fn insert(&mut self, kind: &str, id: i64) -> bool {
+        let inserted = if let Some(ids) = self.by_kind.get_mut(kind) {
+            ids.insert(id)
+        } else {
+            self.by_kind.insert(kind.to_owned(), BTreeSet::from([id]));
+            true
+        };
+        self.count += usize::from(inserted);
+        inserted
+    }
+
+    fn insert_owned(&mut self, kind: String, id: i64) {
+        if self.by_kind.entry(kind).or_default().insert(id) {
+            self.count += 1;
+        }
+    }
+}
+
+impl FromIterator<(String, i64)> for MediaIds {
+    fn from_iter<T: IntoIterator<Item = (String, i64)>>(pairs: T) -> Self {
+        let mut ids = Self::default();
+        for (kind, id) in pairs {
+            ids.insert_owned(kind, id);
+        }
+        ids
+    }
+}
+
+mod media_ids_serde {
+    use super::MediaIds;
+    use serde::{
+        Deserializer, Serializer,
+        de::{SeqAccess, Visitor},
+        ser::SerializeSeq,
+    };
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(ids: &MediaIds, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(ids.len()))?;
+        for (kind, values) in &ids.by_kind {
+            for id in values {
+                sequence.serialize_element(&(kind, id))?;
+            }
+        }
+        sequence.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<MediaIds, D::Error> {
+        struct MediaIdsVisitor;
+
+        impl<'de> Visitor<'de> for MediaIdsVisitor {
+            type Value = MediaIds;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an array of [kind, id] media pairs")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<MediaIds, A::Error> {
+                let mut ids = MediaIds::default();
+                while let Some((kind, id)) = sequence.next_element::<(String, i64)>()? {
+                    ids.insert_owned(kind, id);
+                }
+                Ok(ids)
+            }
+        }
+
+        deserializer.deserialize_seq(MediaIdsVisitor)
     }
 }
 

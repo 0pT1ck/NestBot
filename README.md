@@ -16,7 +16,7 @@ Copy-Item config/secrets.example.env config/secrets.env
 # 修改 TOML 中 api_id、allowed_users、default_target、search_bot、file_bot；填写 secrets.env。
 .\target\release\nestbot.exe --env-file config/secrets.env init
 .\target\release\nestbot.exe --env-file config/secrets.env login
-# 可选上传账号；上传账号须已加入目标聊天。
+# 可选第二账号：用于上传，也在主账号提取受限后接手提取；须已加入目标聊天。
 .\target\release\nestbot.exe --env-file config/secrets.env login --upload
 .\target\release\nestbot.exe --env-file config/secrets.env serve
 ```
@@ -48,7 +48,13 @@ CLI 搜索默认一页；Bot `/search` 默认搜全页。原 Python 业务规则
 
 搜索 Bot 报“发生错误，请稍后重试”时，保留原消息按钮，等 60 秒后重试，最多 20 轮。等待期间会通知当前轮数，`/status` 可查看剩余等待；同一条旧提示不会重复触发重试。迟到的新页先保存，避免多点一次跳页；重试无新回复或次数耗尽时会停止并提示，`/stop` 可随时取消。
 
-搜索和转存的排队消息会持续编辑更新（约每 2 秒，内容未变化时不发送）：搜索显示当前页和总页数，批量转存显示密钥夹内正在处理的密钥序号。Telegram RPC 或 Bot API 要求等待 `x` 秒时，当前任务显示剩余等待，并在 `x + 60` 秒后自动继续原请求；等待不计入正常超时，`/stop` 可随时取消。普通网络错误不会自动重发不确定的发送。
+搜索和转存的排队消息会持续编辑更新（约每 2 秒，内容未变化时不发送）：搜索显示当前页和总页数，批量转存显示密钥夹内正在处理的密钥序号。搜索、下载、上传或 Bot API 要求等待 `x` 秒时，当前任务显示剩余等待，并在 `x + 60` 秒后自动继续原请求；等待不计入正常超时，`/stop` 可随时取消。普通网络错误不会自动重发不确定的发送。
+
+## 提取账号轮换
+
+先用 `login` 登录第一个（主）账号，再用 `login --upload` 登录不同的第二个账号；已有双账号会话无需重新登录或新增配置。服务从主账号开始提取，文件机器人文字提示、按钮弹窗或提取 RPC 报限流时，第二账号接手重试当前密钥；第二账号受限后再切回主账号。成功后继续使用当前提取账号，不会每个密钥都切换。轮换仅影响密钥提取，搜索、上传和转发的账号选择不变。
+
+每个受限账号按提示等待 `x + 60` 秒；切回的账号尚未恢复时等待其剩余冷却时间，不跳过冷却、也不重复增加 60 秒。未登录第二账号时保留单账号等待。中途受限前已收取的媒体先处理并保存完成记录，切换账号重取同一密钥时按媒体 ID 跳过已处理文件，避免跨账号混用私聊消息 ID。`/stop` 可取消冷却等待；服务重启后从主账号重新选择。
 
 ## Bot
 
@@ -73,6 +79,10 @@ sudo systemctl enable --now nestbot
 ```
 
 systemd 默认限制 CPU 50%、内存 512MiB；Web 使用 SSH 隧道访问。数据库和账号会话在 `/var/lib/nestbot`，临时媒体在 `/var/cache/nestbot`，控制 socket 在 `/run/nestbot`，日志进入 journald。
+
+需要所有业务文件留在 `/xxx/nestbot` 时，不要运行系统安装脚本；按 [Linux 部署说明](docs/deployment.md) 中的“单目录安装”解压发布包，保留示例相对路径并使用 `deploy/run-local.sh`。该入口固定工作目录，将程序和 SQLite 临时文件放到安装目录内，不注册系统服务。
+
+启动时自动补齐转存状态及过期记录查询索引。任务确认完成且没有不确定发送后，回收该任务的临时收取记录和任务内去重记录；启动恢复时也回收历史已完成且没有不确定发送任务的这些数据，并清理过期按钮与超过 7 天的 Bot 更新记录。失败、取消及需核对任务的恢复数据保留；完成账本、任务历史、报告和搜索选择范围不删除。旧密钥完成记录的 JSON 格式保持兼容。
 
 ## 目录与旧版迁移
 

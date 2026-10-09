@@ -1,7 +1,7 @@
 use nestbot::{
     application::App,
     config::Config,
-    domain::{Entry, JobPayload, TransferMode},
+    domain::{ClaimRecord, Entry, JobPayload, JobReport, TransferMode, unix_time},
     storage::{Store, vault::Vault},
 };
 use std::sync::Arc;
@@ -166,6 +166,386 @@ async fn recovery_resumes_safe_jobs_but_quarantines_uncertain_sends() {
             .unwrap()
             .is_none()
     );
+}
+
+async fn seed_transient_state(store: &Store, job: &str) {
+    for message in 1..=2 {
+        let media = format!("d:{message}");
+        assert!(
+            store
+                .inbox_push(job, "claim", message, &media)
+                .await
+                .unwrap()
+        );
+        store.mark_media_seen(job, &media).await.unwrap();
+    }
+    store.inbox_done(job, "claim", 1).await.unwrap();
+}
+
+async fn transient_counts(store: &Store, job: &str) -> (u32, u32) {
+    let job = job.to_owned();
+    store
+        .call(move |c| {
+            Ok((
+                c.query_row(
+                    "SELECT count(*) FROM claim_inbox WHERE job_id=?1",
+                    [&job],
+                    |r| r.get(0),
+                )?,
+                c.query_row(
+                    "SELECT count(*) FROM job_media_seen WHERE job_id=?1",
+                    [&job],
+                    |r| r.get(0),
+                )?,
+            ))
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn completed_finish_clears_only_transient_state_and_keeps_ledgers_and_history() {
+    let (_dir, store) = fixture(16);
+    let job = store
+        .enqueue(search("completed"), None, None)
+        .await
+        .unwrap();
+    store.next_job().await.unwrap().unwrap();
+    seed_transient_state(&store, &job).await;
+    store
+        .transfer_intent("completed-scope", "d:1", &job, false)
+        .await
+        .unwrap();
+    store
+        .transfer_done("completed-scope", "d:1", 101)
+        .await
+        .unwrap();
+    let mut claim = ClaimRecord::default();
+    claim.add("d:1");
+    claim.status = "done".into();
+    store.save_claim("completed-claim", &claim).await.unwrap();
+    let report = JobReport {
+        files: 1,
+        warnings: vec!["retained".into()],
+        ..Default::default()
+    };
+    store.save_report(&job, &report).await.unwrap();
+    let entry = Entry {
+        key: "selected".into(),
+        ..Default::default()
+    };
+    let batch = store
+        .save_page("selected", 1, None, vec![entry.clone()])
+        .await
+        .unwrap();
+    store.select_page(&job, &batch, &[entry]).await.unwrap();
+    store.finish(&job, "completed", None, None).await.unwrap();
+
+    assert_eq!(transient_counts(&store, &job).await, (0, 0));
+    assert_eq!(store.job(&job).await.unwrap().unwrap().status, "completed");
+    assert!(store.retry(&job, false).await.is_err());
+    let retained_claim = store.claim_record("completed-claim").await.unwrap();
+    assert!(retained_claim.complete(Some(1)));
+    assert!(retained_claim.contains("d:1"));
+    assert_eq!(
+        store
+            .transfer_status("completed-scope", "d:1")
+            .await
+            .unwrap(),
+        Some(("done".into(), Some(101)))
+    );
+    assert!(
+        store
+            .transfer_intent("completed-scope", "d:1", &job, false)
+            .await
+            .is_err()
+    );
+    assert_eq!(store.report(&job).await.unwrap().warnings, report.warnings);
+    assert_eq!(store.selection_count(&job).await.unwrap(), 1);
+    assert_eq!(
+        store.selected_entries(&job, &batch, 1, 10).await.unwrap()[0]
+            .1
+            .key,
+        "selected"
+    );
+
+    for status in [
+        "failed",
+        "review",
+        "cancelled",
+        "interrupted",
+        "partial",
+        "queued",
+        "running",
+        "waiting",
+    ] {
+        let retained = store.enqueue(search(status), None, None).await.unwrap();
+        seed_transient_state(&store, &retained).await;
+        store
+            .finish(&retained, status, Some("retained"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            transient_counts(&store, &retained).await,
+            (2, 2),
+            "{status}"
+        );
+        assert!(
+            store.media_seen(&retained, "d:1").await.unwrap(),
+            "{status}"
+        );
+        assert!(
+            !store
+                .inbox_push(&retained, "claim", 99, "d:1")
+                .await
+                .unwrap(),
+            "{status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn completed_finish_preserves_cancelled_and_uncertain_recovery_state() {
+    let (_dir, store) = fixture(5);
+    let cancelled = store
+        .enqueue(search("cancel-race"), None, None)
+        .await
+        .unwrap();
+    store.next_job().await.unwrap().unwrap();
+    seed_transient_state(&store, &cancelled).await;
+    store.cancel(&cancelled).await.unwrap();
+    store
+        .finish(&cancelled, "completed", None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.job(&cancelled).await.unwrap().unwrap().status,
+        "cancelled"
+    );
+    assert_eq!(transient_counts(&store, &cancelled).await, (2, 2));
+    store.retry(&cancelled, false).await.unwrap();
+    assert!(store.media_seen(&cancelled, "d:1").await.unwrap());
+    assert!(
+        !store
+            .inbox_push(&cancelled, "claim", 99, "d:1")
+            .await
+            .unwrap()
+    );
+
+    let uncertain = store
+        .enqueue(search("uncertain-completion"), None, None)
+        .await
+        .unwrap();
+    seed_transient_state(&store, &uncertain).await;
+    store
+        .transfer_intent("uncertain-scope", "d:1", &uncertain, false)
+        .await
+        .unwrap();
+    store
+        .finish(&uncertain, "completed", None, None)
+        .await
+        .unwrap();
+    assert_eq!(transient_counts(&store, &uncertain).await, (2, 2));
+    assert!(store.has_uncertain(&uncertain).await.unwrap());
+    assert!(
+        store
+            .transfer_intent("uncertain-scope", "d:1", &uncertain, true)
+            .await
+            .is_err()
+    );
+    store.recover().await.unwrap();
+    assert_eq!(transient_counts(&store, &uncertain).await, (2, 2));
+    store
+        .finish(&uncertain, "review", Some("transfer_uncertain"), None)
+        .await
+        .unwrap();
+    assert!(store.retry(&uncertain, false).await.is_err());
+    store.retry(&uncertain, true).await.unwrap();
+    assert!(!store.has_uncertain(&uncertain).await.unwrap());
+    assert_eq!(transient_counts(&store, &uncertain).await, (2, 2));
+}
+
+#[tokio::test]
+async fn finish_cleanup_failure_rolls_back_status_and_all_transient_deletions() {
+    let (dir, store) = fixture(5);
+    let job = store.enqueue(search("rollback"), None, None).await.unwrap();
+    store.next_job().await.unwrap().unwrap();
+    store
+        .progress(&job, "transferring", 1, Some(2))
+        .await
+        .unwrap();
+    seed_transient_state(&store, &job).await;
+    store
+        .transfer_intent("rollback-scope", "d:1", &job, false)
+        .await
+        .unwrap();
+    store
+        .transfer_done("rollback-scope", "d:1", 101)
+        .await
+        .unwrap();
+    store.call(|c| {
+        c.execute_batch("CREATE TRIGGER reject_cleanup BEFORE DELETE ON job_media_seen BEGIN SELECT RAISE(ABORT,'cleanup_failed'); END;")?;
+        Ok(())
+    }).await.unwrap();
+
+    assert!(store.finish(&job, "completed", None, None).await.is_err());
+    assert_eq!(store.job(&job).await.unwrap().unwrap().status, "running");
+    assert_eq!(
+        store.job(&job).await.unwrap().unwrap().phase,
+        "transferring"
+    );
+    assert_eq!(transient_counts(&store, &job).await, (2, 2));
+    store
+        .call(|c| {
+            c.execute_batch("DROP TRIGGER reject_cleanup;")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let vault = store.vault.clone();
+    drop(store);
+    let reopened = Store::open(&dir.path().join("test.sqlite"), vault, 1024, 5).unwrap();
+    reopened.recover().await.unwrap();
+    assert_eq!(reopened.job(&job).await.unwrap().unwrap().status, "queued");
+    assert_eq!(transient_counts(&reopened, &job).await, (2, 2));
+    assert!(!reopened.inbox_push(&job, "claim", 99, "d:1").await.unwrap());
+    assert_eq!(
+        reopened
+            .transfer_status("rollback-scope", "d:1")
+            .await
+            .unwrap(),
+        Some(("done".into(), Some(101)))
+    );
+}
+
+#[tokio::test]
+async fn old_database_upgrade_and_recovery_prune_only_completed_transients_and_expired_controls() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault =
+        Arc::new(Vault::open(&dir.path().join("master.key"), "synthetic-vault-password").unwrap());
+    let path = dir.path().join("test.sqlite");
+    let old = rusqlite::Connection::open(&path).unwrap();
+    old.execute_batch(include_str!("../migrations/001_initial.sql"))
+        .unwrap();
+    old.execute_batch(include_str!("../migrations/002_behavior.sql"))
+        .unwrap();
+    old.execute_batch(include_str!("../migrations/003_batch_progress.sql"))
+        .unwrap();
+    let now = unix_time();
+    for (id, status) in [
+        ("completed", "completed"),
+        ("uncertain", "completed"),
+        ("failed", "failed"),
+        ("review", "review"),
+        ("cancelled", "cancelled"),
+        ("interrupted", "interrupted"),
+        ("partial", "partial"),
+        ("queued", "queued"),
+        ("running", "running"),
+        ("waiting", "waiting"),
+    ] {
+        old.execute("INSERT INTO jobs(id,kind,status,payload,created_at,updated_at) VALUES(?1,'search',?2,X'00',?3,?3)", rusqlite::params![id, status, now]).unwrap();
+        old.execute("INSERT INTO claim_inbox(job_id,claim,message_id,media_id,processed) VALUES(?1,'claim',1,'d:1',0),(?1,'claim',2,'d:2',1)", [id]).unwrap();
+        old.execute(
+            "INSERT INTO job_media_seen VALUES(?1,'d:1'),(?1,'d:2')",
+            [id],
+        )
+        .unwrap();
+    }
+    old.execute("INSERT INTO transfers VALUES('done-scope','d:1','completed','done',101,?1),('uncertain-scope','d:1','uncertain','sending',NULL,?1)", [now]).unwrap();
+    old.execute_batch("INSERT INTO claims VALUES('claim',X'00'); INSERT INTO legacy_claims VALUES('legacy',X'00'); INSERT INTO preferences VALUES('report:completed',X'00'); INSERT INTO search_selection VALUES('completed','batch',1);").unwrap();
+    old.execute(
+        "INSERT INTO bot_updates VALUES(1,?1),(2,?2)",
+        rusqlite::params![now - 8 * 86400, now],
+    )
+    .unwrap();
+    for (id, expires) in [("expired", now - 10), ("live", now + 3600)] {
+        let body = vault
+            .encrypt(&format!("callback:{id}"), br#"{"retained":true}"#)
+            .unwrap();
+        old.execute(
+            "INSERT INTO bot_callbacks VALUES(?1,42,?2,?3)",
+            rusqlite::params![id, expires, body],
+        )
+        .unwrap();
+    }
+    drop(old);
+
+    // Reopening runs all migrations repeatedly, including upgrading an inbox without group_id.
+    for _ in 0..2 {
+        let store = Store::open(&path, vault.clone(), 1024, 32).unwrap();
+        store.recover().await.unwrap();
+        assert_eq!(transient_counts(&store, "completed").await, (0, 0));
+        for retained in [
+            "uncertain",
+            "failed",
+            "review",
+            "cancelled",
+            "interrupted",
+            "partial",
+            "queued",
+            "running",
+            "waiting",
+        ] {
+            assert_eq!(
+                transient_counts(&store, retained).await,
+                (2, 2),
+                "{retained}"
+            );
+            assert!(
+                !store
+                    .inbox_push_group(retained, "claim", 99, "d:1", Some(7))
+                    .await
+                    .unwrap(),
+                "{retained}"
+            );
+        }
+        assert!(store.has_uncertain("uncertain").await.unwrap());
+        assert_eq!(
+            store.transfer_status("done-scope", "d:1").await.unwrap(),
+            Some(("done".into(), Some(101)))
+        );
+        assert!(store.callback_value(42, "expired").await.unwrap().is_none());
+        assert_eq!(
+            store.callback_value(42, "live").await.unwrap(),
+            Some(serde_json::json!({"retained": true}))
+        );
+        let counts = store
+            .call(|c| {
+                Ok((
+                    c.query_row("SELECT count(*) FROM jobs", [], |r| r.get::<_, u32>(0))?,
+                    c.query_row("SELECT count(*) FROM claims", [], |r| r.get::<_, u32>(0))?,
+                    c.query_row("SELECT count(*) FROM legacy_claims", [], |r| {
+                        r.get::<_, u32>(0)
+                    })?,
+                    c.query_row("SELECT count(*) FROM preferences", [], |r| {
+                        r.get::<_, u32>(0)
+                    })?,
+                    c.query_row("SELECT count(*) FROM search_selection", [], |r| {
+                        r.get::<_, u32>(0)
+                    })?,
+                    c.query_row(
+                        "SELECT count(*) FROM bot_updates WHERE update_id=1",
+                        [],
+                        |r| r.get::<_, u32>(0),
+                    )?,
+                    c.query_row(
+                        "SELECT count(*) FROM bot_updates WHERE update_id=2",
+                        [],
+                        |r| r.get::<_, u32>(0),
+                    )?,
+                    c.query_row("SELECT count(*) FROM bot_callbacks", [], |r| {
+                        r.get::<_, u32>(0)
+                    })?,
+                    c.query_row("SELECT max(version) FROM schema_version", [], |r| {
+                        r.get::<_, u32>(0)
+                    })?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(counts, (10, 1, 1, 1, 1, 0, 1, 1, 4));
+    }
 }
 
 #[tokio::test]
