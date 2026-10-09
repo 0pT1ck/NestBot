@@ -17,8 +17,8 @@ default_mode = "copy"
 [paths]
 # 中文：数据库、加密账号会话及 master.key 所在目录。备份数据库时也要安全备份主密钥。
 # English: Directory for the database, encrypted sessions and master.key. Back up the master key too.
-# 中文：以下相对路径以启动程序时的工作目录为基准；Linux 服务建议使用绝对路径。
-# English: Relative paths use the process working directory; use absolute paths for Linux services.
+# 中文：相对路径以工作目录为基准；单目录安装请保留默认值，通过 deploy/run-local.sh 固定工作目录。
+# English: Relative paths use the working directory; keep these defaults and use deploy/run-local.sh for directory-local installs.
 data = ".local/data"
 # 中文：deep 转存的临时媒体目录，需要足够的磁盘空间，与内存容量无关。
 # English: Temporary media directory for deep transfers; requires disk space, independently of RAM.

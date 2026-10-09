@@ -1,33 +1,91 @@
-name: Verify and build
+name: Verify and publish Linux
 on:
   push:
   pull_request:
   workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
-      - run: cargo build --locked --release
-      - name: Smoke directory-local launcher
+      - run: sh -n deploy/install.sh && sh -n deploy/run-local.sh
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup toolchain install 1.99.0 --profile minimal --target ${{ matrix.target }}
+      - name: Build static program
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Verify and package
         run: |
-          cp target/release/nestbot nestbot
-          cp config/nestbot.example.toml config/nestbot.toml
-          cp config/secrets.example.env config/secrets.env
-          root="$PWD"
-          (
-            cd /tmp
-            "$root/deploy/run-local.sh" doctor
-            "$root/deploy/run-local.sh" init
-          )
-          test -f .local/data/nestbot.sqlite
-          test -f .local/data/master.key
-      - run: tar -czf nestbot-linux-x86_64.tar.gz nestbot deploy config/nestbot.example.toml config/secrets.example.env README.md docs
+          binary="target/${{ matrix.target }}/release/nestbot"
+          "$binary" --help
+          if readelf -l "$binary" | grep -q INTERP; then
+            echo 'Expected a static musl executable.' >&2
+            exit 1
+          fi
+          cp "$binary" nestbot
+          archive="nestbot-linux-${{ matrix.arch }}.tar.gz"
+          tar -czf "$archive" nestbot deploy config/nestbot.example.toml config/secrets.example.env README.md docs
+          sha256sum "$archive" > "$archive.sha256"
+      - name: Exercise one-command installation
+        run: python3 .github/scripts/installer_smoke.py nestbot-linux-${{ matrix.arch }}.tar.gz
       - uses: actions/upload-artifact@v4
         with:
-          name: nestbot-linux-x86_64
-          path: nestbot-linux-x86_64.tar.gz
+          name: nestbot-linux-${{ matrix.arch }}
+          path: |
+            nestbot-linux-${{ matrix.arch }}.tar.gz
+            nestbot-linux-${{ matrix.arch }}.tar.gz.sha256
+  publish:
+    needs: [test, build]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: nestbot-linux-*
+          merge-multiple: true
+          path: dist
+      - name: Publish complete public release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="build-${GITHUB_SHA}"
+          if gh release view "$tag" --json isDraft --jq '.isDraft' > release-state 2>/dev/null; then
+            if [ "$(cat release-state)" = false ]; then
+              echo 'This commit already has a published release.'
+              exit 0
+            fi
+          else
+            gh release create "$tag" --draft --target "$GITHUB_SHA" --title "NestBot ${GITHUB_SHA:0:7}" --notes 'Static Linux x86_64/aarch64 programs, SHA-256 checksums and single-directory installer. No compilation required on the VPS.'
+          fi
+          gh release upload "$tag" dist/*.tar.gz dist/*.sha256 --clobber
+          gh release edit "$tag" --draft=false --latest

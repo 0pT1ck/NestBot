@@ -68,19 +68,17 @@ CLI 搜索默认一页；Bot `/search` 默认搜全页。原 Python 业务规则
 
 ## Linux 部署
 
-在开发机或 CI 构建 Linux release，不在小 VPS 上编译。CI 生成包含程序和部署文件的压缩包。详见 [部署说明](docs/deployment.md)。
+在 SSH 终端以拥有安装目录的用户执行，无需克隆、编译或 `sudo`：
 
 ```sh
-sudo sh deploy/install.sh
-# 修改 /etc/nestbot/nestbot.toml 和 /etc/nestbot/secrets.env
-sudo -u nestbot nestbot --config /etc/nestbot/nestbot.toml --env-file /etc/nestbot/secrets.env init
-sudo -u nestbot nestbot --config /etc/nestbot/nestbot.toml --env-file /etc/nestbot/secrets.env login
-sudo systemctl enable --now nestbot
+curl -fsSL https://raw.githubusercontent.com/0pT1ck/NestBot/main/deploy/install.sh | sh
 ```
 
-systemd 默认限制 CPU 50%、内存 512MiB；Web 使用 SSH 隧道访问。数据库和账号会话在 `/var/lib/nestbot`，临时媒体在 `/var/cache/nestbot`，控制 socket 在 `/run/nestbot`，日志进入 journald。
+默认安装到 `$HOME/nestbot`，自动选择 Linux x86_64/aarch64 静态程序，校验 SHA-256，交互填写配置、登录账号并后台启动。指定目录可在末尾改用 `sh -s -- --dir /xxx/nestbot`；该目录须可写。已有配置、凭据和主密钥不覆盖，运行中的服务不替换。
 
-需要所有业务文件留在 `/xxx/nestbot` 时，不要运行系统安装脚本；按 [Linux 部署说明](docs/deployment.md) 中的“单目录安装”解压发布包，保留示例相对路径并使用 `deploy/run-local.sh`。该入口固定工作目录，将程序和 SQLite 临时文件放到安装目录内，不注册系统服务。
+程序、配置、数据库、账号会话、缓存、临时文件和日志均保留在安装目录，不创建系统用户、不注册 systemd、不写入 `/etc`、`/usr/local` 或 `/var`。操作系统自己的 SSH 日志、swap 等不属于程序数据。后台运行可在退出 SSH 后继续，但不自动开机启动、故障重启或轮转日志，也没有 systemd 硬性资源限额。
+
+启动、状态、停止和重启分别使用 `~/nestbot/deploy/run-local.sh start`、`status`、`shutdown`、`restart`。`stop` 仍只停止任务。账号登录与更新前先 `shutdown`。完整的新手说明、凭据准备、SSH 隧道和更新方式见 [部署说明](docs/deployment.md)。
 
 启动时自动补齐转存状态及过期记录查询索引。任务确认完成且没有不确定发送后，回收该任务的临时收取记录和任务内去重记录；启动恢复时也回收历史已完成且没有不确定发送任务的这些数据，并清理过期按钮与超过 7 天的 Bot 更新记录。失败、取消及需核对任务的恢复数据保留；完成账本、任务历史、报告和搜索选择范围不删除。旧密钥完成记录的 JSON 格式保持兼容。
 
