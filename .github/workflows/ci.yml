@@ -38,8 +38,10 @@ jobs:
       - run: rustup toolchain install 1.99.0 --profile minimal --target ${{ matrix.target }}
       - name: Build static program
         env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          # Compile C dependencies with musl; Rust uses its self-contained linker setup.
+          # Debian musl-gcc as the final linker breaks x86_64 static PIE (rust#95926).
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
         run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Verify and package
         run: |

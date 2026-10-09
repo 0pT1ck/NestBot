@@ -79,6 +79,7 @@ with tempfile.TemporaryDirectory(prefix="nb-smoke.", dir="/tmp") as temporary:
     pidfile = root / ".local/run/service.pid"
     sleeper = None
     try:
+        run(command, env=dict(env, INSTALL_ROOT="/tmp/../.."), ok=False)
         run(command, env=env)
         run([str(helper), "status"], env=env)
         pid = pidfile.read_text()

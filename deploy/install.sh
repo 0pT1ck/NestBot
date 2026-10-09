@@ -139,6 +139,7 @@ main() {
     umask 077
     mkdir -p "$INSTALL_DIR"
     ROOT=$(CDPATH= cd -- "$INSTALL_DIR" && pwd -P)
+    [ "$ROOT" != / ] || fail '安装目录不能解析为根目录 /。'
     cd "$ROOT"
     if [ -x deploy/run-local.sh ] && [ -x nestbot ] && deploy/run-local.sh status >/dev/null 2>&1; then
         printf '现有服务已运行；未替换运行中的程序，也未覆盖配置。\n'
