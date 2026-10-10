@@ -39,14 +39,13 @@ struct Header {
 
 pub struct EncryptedSession {
     store: Store,
-    role: String,
     header: Mutex<Header>,
 }
 
 impl EncryptedSession {
-    pub async fn open(store: Store, role: &str) -> anyhow::Result<Arc<Self>> {
+    pub async fn open(store: Store) -> anyhow::Result<Arc<Self>> {
         let default = SessionData::default();
-        let header = match store.preference(&format!("session:{role}:header")).await? {
+        let header = match store.preference("session:main:header").await? {
             Some(serialized) => serde_json::from_str(&serialized)?,
             None => Header {
                 home: default.home_dc,
@@ -56,7 +55,6 @@ impl EncryptedSession {
         };
         Ok(Arc::new(Self {
             store,
-            role: role.into(),
             header: Mutex::new(header),
         }))
     }
@@ -65,20 +63,16 @@ impl EncryptedSession {
         let serialized =
             serde_json::to_string(&*self.header.lock().map_err(|_| "session_unavailable")?)?;
         self.store
-            .set_preference(&format!("session:{}:header", self.role), &serialized)
+            .set_preference("session:main:header", &serialized)
             .await?;
         Ok(())
     }
 
     fn peer_key(&self, peer: PeerId) -> String {
         if peer == PeerId::self_user() {
-            format!("session:{}:self", self.role)
+            "session:main:self".into()
         } else {
-            format!(
-                "session:{}:peer:{}",
-                self.role,
-                peer.bot_api_dialog_id_unchecked()
-            )
+            format!("session:main:peer:{}", peer.bot_api_dialog_id_unchecked())
         }
     }
 }

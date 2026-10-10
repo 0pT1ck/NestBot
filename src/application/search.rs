@@ -406,7 +406,7 @@ pub async fn run(
         .warnings
         .retain(|warning| !warning.starts_with("search_"));
     app.store.save_report(&job.summary.id, &report).await?;
-    let account = app.users.account(false, cancel).await?;
+    let account = app.users.account(cancel).await?;
     let timeout = app.config.limits.request_timeout_secs;
     let peer = bounded(
         cancel,

@@ -21,7 +21,6 @@ jobs:
         run: python3 .github/scripts/terminal_smoke.py
       - run: sh -n deploy/install.sh && sh -n deploy/run-local.sh
   build:
-    needs: test
     strategy:
       fail-fast: false
       matrix:

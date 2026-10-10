@@ -33,7 +33,6 @@ tokio::task_local! {
     // Nested transfer and RPC deadlines must both exclude server-requested waits.
     static FLOOD_BUDGETS: Vec<watch::Sender<Duration>>;
     static FLOOD_EVENTS: watch::Sender<Option<FloodNotice>>;
-    static EXTRACTION_RPC: bool;
 }
 
 #[derive(Clone, Copy)]
@@ -43,10 +42,7 @@ pub(crate) struct FloodNotice {
 }
 
 pub(crate) fn flood_delay(seconds: u64) -> Duration {
-    flood_delay_for(seconds, Duration::from_secs(seconds.saturating_add(60)))
-}
-
-fn flood_delay_for(seconds: u64, delay: Duration) -> Duration {
+    let delay = Duration::from_secs(seconds.saturating_add(60));
     let _ = FLOOD_BUDGETS.try_with(|budgets| {
         for budget in budgets {
             budget.send_modify(|total| *total += delay);
@@ -73,20 +69,7 @@ fn flood_delay_for(seconds: u64, delay: Duration) -> Duration {
 }
 
 pub(crate) async fn wait_flood(cancel: &CancellationToken, seconds: u64) -> anyhow::Result<()> {
-    wait_flood_for(
-        cancel,
-        seconds,
-        Duration::from_secs(seconds.saturating_add(60)),
-    )
-    .await
-}
-
-async fn wait_flood_for(
-    cancel: &CancellationToken,
-    seconds: u64,
-    delay: Duration,
-) -> anyhow::Result<()> {
-    let delay = flood_delay_for(seconds, delay);
+    let delay = flood_delay(seconds);
     tokio::select! {
         biased;
         _ = cancel.cancelled() => anyhow::bail!("cancelled"),
@@ -101,30 +84,22 @@ pub(crate) async fn flood_scope<T>(
     FLOOD_EVENTS.scope(events, future).await
 }
 
-pub(crate) async fn extraction_scope<T>(future: impl std::future::Future<Output = T>) -> T {
-    EXTRACTION_RPC.scope(true, future).await
-}
-
-// Tokio tasks do not inherit task locals. The media collector must share the
-// extraction retry policy, report waits, and extend enclosing deadlines.
+// Tokio tasks do not inherit task locals. The media collector must report
+// server-requested waits and extend enclosing deadlines.
 pub(crate) fn inherit_flood_context<T>(
     future: impl std::future::Future<Output = T>,
 ) -> impl std::future::Future<Output = T> {
     let budgets = FLOOD_BUDGETS.try_with(Clone::clone).unwrap_or_default();
     let events = FLOOD_EVENTS.try_with(Clone::clone).ok();
-    let extraction = EXTRACTION_RPC.try_with(|active| *active).unwrap_or(false);
     async move {
-        EXTRACTION_RPC
-            .scope(
-                extraction,
-                FLOOD_BUDGETS.scope(budgets, async move {
-                    if let Some(events) = events {
-                        flood_scope(events, future).await
-                    } else {
-                        future.await
-                    }
-                }),
-            )
+        FLOOD_BUDGETS
+            .scope(budgets, async move {
+                if let Some(events) = events {
+                    flood_scope(events, future).await
+                } else {
+                    future.await
+                }
+            })
             .await
     }
 }
@@ -166,10 +141,10 @@ impl RetryPolicy for TelegramFloodSleep {
         let InvocationError::Rpc(error) = &ctx.error else {
             return ControlFlow::Break(());
         };
-        let seconds = error.value.unwrap_or(60).max(1) as u64;
+        let seconds = error.value.unwrap_or(60) as u64;
         // Telegram definitively rejected this RPC. Grammers retries its original
         // serialized request, preserving random IDs; ambiguous failures never retry.
-        if error.code != 420 || EXTRACTION_RPC.try_with(|active| *active).unwrap_or(false) {
+        if error.code != 420 {
             return ControlFlow::Break(());
         }
         let delay = flood_delay(seconds);
@@ -194,7 +169,7 @@ impl std::error::Error for TelegramRejected {}
 pub fn rpc(error: InvocationError) -> anyhow::Error {
     match error {
         InvocationError::Rpc(ref e) if e.code == 420 => RetryLater {
-            seconds: e.value.unwrap_or(60).max(1) as u64,
+            seconds: e.value.unwrap_or(60) as u64,
         }
         .into(),
         InvocationError::Rpc(ref e) if (400..500).contains(&e.code) => TelegramRejected.into(),
@@ -259,9 +234,9 @@ impl Drop for Account {
 }
 
 impl Account {
-    pub async fn connect(config: &Config, store: Store, role: &str) -> anyhow::Result<Self> {
+    pub async fn connect(config: &Config, store: Store) -> anyhow::Result<Self> {
         anyhow::ensure!(config.telegram.api_id > 0, "missing_api_credentials");
-        let session = session::EncryptedSession::open(store, role).await?;
+        let session = session::EncryptedSession::open(store).await?;
         let proxy = Config::env_secret(&config.telegram.proxy_env).map(|v| v.to_string());
         anyhow::ensure!(
             proxy.as_ref().is_none_or(|p| p.starts_with("socks5://")),
@@ -448,44 +423,10 @@ impl Account {
     }
 }
 
-// Extraction alone shares a sticky choice and per-account cooldowns. Sender
-// selection and ordinary account lookup never consult this state.
-#[derive(Default)]
-struct ExtractionAccounts {
-    upload: bool,
-    cooling: [Option<tokio::time::Instant>; 2],
-}
-
-impl ExtractionAccounts {
-    fn choose(
-        &mut self,
-        has_upload: bool,
-        now: tokio::time::Instant,
-    ) -> (bool, Option<tokio::time::Instant>) {
-        if !has_upload {
-            self.upload = false;
-        }
-        let preferred = usize::from(self.upload);
-        if self.cooling[preferred].is_none_or(|until| until <= now) {
-            return (self.upload, None);
-        }
-        (self.upload, self.cooling[usize::from(self.upload)])
-    }
-
-    fn limited(&mut self, upload: bool, seconds: u64) {
-        let until = tokio::time::Instant::now() + Duration::from_secs(seconds.saturating_add(60));
-        let cooling = &mut self.cooling[usize::from(upload)];
-        *cooling = Some(cooling.map_or(until, |old| old.max(until)));
-        self.upload = !upload;
-    }
-}
-
 pub struct Users {
     config: Arc<Config>,
     store: Store,
     main: Mutex<Option<Arc<Account>>>,
-    upload: Mutex<Option<Arc<Account>>>,
-    extraction: Mutex<ExtractionAccounts>,
 }
 
 impl Users {
@@ -494,28 +435,16 @@ impl Users {
             config,
             store,
             main: Mutex::new(None),
-            upload: Mutex::new(None),
-            extraction: Mutex::new(ExtractionAccounts::default()),
         }
     }
 
-    pub async fn account(
-        &self,
-        upload: bool,
-        cancel: &CancellationToken,
-    ) -> anyhow::Result<Arc<Account>> {
-        let slot = if upload { &self.upload } else { &self.main };
-        let mut slot = slot.lock().await;
+    pub async fn account(&self, cancel: &CancellationToken) -> anyhow::Result<Arc<Account>> {
+        let mut slot = self.main.lock().await;
         if let Some(account) = slot.as_ref() {
             return Ok(account.clone());
         }
         let account = bounded(cancel, self.config.limits.request_timeout_secs, async {
-            let account = Account::connect(
-                &self.config,
-                self.store.clone(),
-                if upload { "upload" } else { "main" },
-            )
-            .await?;
+            let account = Account::connect(&self.config, self.store.clone()).await?;
             anyhow::ensure!(
                 account.client.is_authorized().await.map_err(rpc)?,
                 "main_account_not_logged_in"
@@ -525,70 +454,6 @@ impl Users {
         .await?;
         *slot = Some(account.clone());
         Ok(account)
-    }
-
-    /// Select the extraction source, preserving it until it is rate limited.
-    pub(crate) async fn extraction_choice(
-        &self,
-        cancel: &CancellationToken,
-    ) -> anyhow::Result<bool> {
-        loop {
-            anyhow::ensure!(!cancel.is_cancelled(), "cancelled");
-            let has_upload = self
-                .store
-                .preference("session:upload:self")
-                .await?
-                .is_some();
-            let (upload, until) = self
-                .extraction
-                .lock()
-                .await
-                .choose(has_upload, tokio::time::Instant::now());
-            let Some(until) = until else {
-                return Ok(upload);
-            };
-            let delay = until.saturating_duration_since(tokio::time::Instant::now());
-            // The safety minute was added when marking the account. Report and
-            // wait only its remaining cooldown, never add that minute twice.
-            wait_flood_for(cancel, delay.as_secs().saturating_sub(60), delay).await?;
-        }
-    }
-
-    /// Return the selected source without falling back on connection errors.
-    pub async fn extraction_account(
-        &self,
-        cancel: &CancellationToken,
-    ) -> anyhow::Result<(bool, Arc<Account>)> {
-        loop {
-            let upload = self.extraction_choice(cancel).await?;
-            let account = self.account(upload, cancel).await?;
-            let state = self.extraction.lock().await;
-            // Connecting may have overlapped another extraction's rejection.
-            if state.upload == upload
-                && state.cooling[usize::from(upload)]
-                    .is_none_or(|until| until <= tokio::time::Instant::now())
-            {
-                return Ok((upload, account));
-            }
-        }
-    }
-
-    pub async fn extraction_limited(&self, upload: bool, seconds: u64) -> anyhow::Result<()> {
-        self.extraction.lock().await.limited(upload, seconds);
-        Ok(())
-    }
-
-    pub async fn sender(&self, cancel: &CancellationToken) -> anyhow::Result<Arc<Account>> {
-        if self
-            .store
-            .preference("session:upload:self")
-            .await?
-            .is_some()
-        {
-            self.account(true, cancel).await
-        } else {
-            self.account(false, cancel).await
-        }
     }
 }
 
@@ -690,165 +555,49 @@ mod flood_tests {
         assert_eq!(start.elapsed(), Duration::from_secs(122));
     }
 
-    #[tokio::test]
-    async fn extraction_floods_surface_without_sleeping_or_changing_normal_retries() {
+    #[tokio::test(start_paused = true)]
+    async fn collector_rpc_waits_exactly_the_returned_time_plus_60_without_timing_out() {
         let (events, notices) = watch::channel(None);
         let cancel = CancellationToken::new();
+        let start = tokio::time::Instant::now();
         flood_scope(
             events,
-            bounded(
-                &cancel,
-                2,
-                extraction_scope(async {
-                    assert!(TelegramFloodSleep.should_retry(&context(763, 1)).is_break());
-                    assert_eq!(flood_waited(), Duration::ZERO);
-                    assert!(notices.borrow().is_none());
-                    let error = rpc(context(763, 1).error);
-                    assert_eq!(error.downcast_ref::<RetryLater>().unwrap().seconds, 763);
-                    Ok(())
-                }),
-            ),
+            bounded(&cancel, 2, async {
+                tokio::spawn(inherit_flood_context(async {
+                    let ControlFlow::Continue(delay) =
+                        TelegramFloodSleep.should_retry(&context(7200, 1))
+                    else {
+                        panic!("rate-limited collector must retry the same RPC");
+                    };
+                    tokio::time::sleep(delay).await;
+                }))
+                .await?;
+                assert_eq!(flood_waited(), Duration::from_secs(7260));
+                Ok(())
+            }),
         )
         .await
         .unwrap();
-        assert_eq!(
-            TelegramFloodSleep.should_retry(&context(763, 1)),
-            ControlFlow::Continue(Duration::from_secs(823))
-        );
+        assert_eq!(start.elapsed(), Duration::from_secs(7260));
+        let notice = notices.borrow().unwrap();
+        assert_eq!(notice.wait.seconds, 7200);
+        assert_eq!(notice.until, start + Duration::from_secs(7260));
     }
 
-    #[tokio::test]
-    async fn collector_inherits_extraction_policy_and_flood_reporting_context() {
-        let (events, notices) = watch::channel(None);
-        let cancel = CancellationToken::new();
-        flood_scope(
-            events,
-            bounded(
-                &cancel,
-                2,
-                extraction_scope(async {
-                    tokio::spawn(inherit_flood_context(async {
-                        assert!(TelegramFloodSleep.should_retry(&context(20, 1)).is_break());
-                        assert_eq!(flood_waited(), Duration::ZERO);
-                        // Explicit cooldown waits still share the parent's budget/events.
-                        flood_delay(20);
-                    }))
-                    .await
-                    .unwrap();
-                    assert_eq!(flood_waited(), Duration::from_secs(80));
-                    assert_eq!(notices.borrow().unwrap().wait.seconds, 20);
-                    Ok(())
-                }),
-            ),
-        )
-        .await
-        .unwrap();
-        let normal = tokio::spawn(inherit_flood_context(async {
-            TelegramFloodSleep.should_retry(&context(20, 1))
-        }))
-        .await
-        .unwrap();
-        assert_eq!(normal, ControlFlow::Continue(Duration::from_secs(80)));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn extraction_rotates_main_upload_main_and_sticks_across_successful_keys() {
-        let (_dir, app) = crate::interfaces::progress::tests::fixture();
-        app.store
-            .set_preference("session:upload:self", "fixture")
-            .await
-            .unwrap();
-        let cancel = CancellationToken::new();
-        for _ in 0..3 {
-            assert!(!app.users.extraction_choice(&cancel).await.unwrap());
+    #[test]
+    fn zero_seconds_is_not_rounded_up_and_long_waits_are_not_capped() {
+        for seconds in [0, 1, 7200, 86400] {
+            assert_eq!(
+                TelegramFloodSleep.should_retry(&context(seconds, 1)),
+                ControlFlow::Continue(Duration::from_secs(u64::from(seconds) + 60))
+            );
+            assert_eq!(
+                rpc(context(seconds, 1).error)
+                    .downcast_ref::<RetryLater>()
+                    .unwrap()
+                    .seconds,
+                u64::from(seconds)
+            );
         }
-        app.users.extraction_limited(false, 10).await.unwrap();
-        assert!(app.users.extraction_choice(&cancel).await.unwrap());
-        tokio::time::advance(Duration::from_secs(70)).await;
-        // Main has recovered, but successful keys must remain on upload.
-        for _ in 0..3 {
-            assert!(app.users.extraction_choice(&cancel).await.unwrap());
-        }
-        app.users.extraction_limited(true, 20).await.unwrap();
-        for _ in 0..3 {
-            assert!(!app.users.extraction_choice(&cancel).await.unwrap());
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn both_cooling_wait_for_next_account_even_when_other_recovers_first() {
-        let (_dir, app) = crate::interfaces::progress::tests::fixture();
-        app.store
-            .set_preference("session:upload:self", "fixture")
-            .await
-            .unwrap();
-        let cancel = CancellationToken::new();
-        let start = tokio::time::Instant::now();
-        app.users.extraction_limited(false, 200).await.unwrap();
-        app.users.extraction_limited(true, 20).await.unwrap();
-        tokio::time::advance(Duration::from_secs(30)).await;
-        let (events, notices) = watch::channel(None);
-        assert!(
-            !flood_scope(
-                events,
-                bounded(&cancel, 2, async {
-                    app.users.extraction_choice(&cancel).await
-                })
-            )
-            .await
-            .unwrap()
-        );
-        assert_eq!(start.elapsed(), Duration::from_secs(260));
-        assert_eq!(
-            notices.borrow().unwrap().until,
-            start + Duration::from_secs(260)
-        );
-        assert!(!app.users.extraction_choice(&cancel).await.unwrap());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn both_cooling_wait_is_cancellable_and_does_not_hold_selector_lock() {
-        let (_dir, app) = crate::interfaces::progress::tests::fixture();
-        app.store
-            .set_preference("session:upload:self", "fixture")
-            .await
-            .unwrap();
-        app.users.extraction_limited(false, 100).await.unwrap();
-        app.users.extraction_limited(true, 200).await.unwrap();
-        let cancel = CancellationToken::new();
-        let (events, mut notices) = watch::channel(None);
-        let start = tokio::time::Instant::now();
-        let (selection, ()) = tokio::join!(
-            flood_scope(events, app.users.extraction_choice(&cancel)),
-            async {
-                notices.changed().await.unwrap();
-                app.users.extraction_limited(false, 300).await.unwrap();
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                cancel.cancel();
-            },
-        );
-        assert_eq!(selection.unwrap_err().to_string(), "cancelled");
-        assert_eq!(start.elapsed(), Duration::from_secs(1));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn missing_upload_login_waits_for_main_instead_of_using_second_account() {
-        let (_dir, app) = crate::interfaces::progress::tests::fixture();
-        let cancel = CancellationToken::new();
-        assert!(!app.users.extraction_choice(&cancel).await.unwrap());
-        app.users.extraction_limited(false, 10).await.unwrap();
-        let start = tokio::time::Instant::now();
-        assert!(!app.users.extraction_choice(&cancel).await.unwrap());
-        assert_eq!(start.elapsed(), Duration::from_secs(70));
-        app.users.extraction_limited(false, 10).await.unwrap();
-        cancel.cancel();
-        assert_eq!(
-            app.users
-                .extraction_choice(&cancel)
-                .await
-                .unwrap_err()
-                .to_string(),
-            "cancelled"
-        );
     }
 }

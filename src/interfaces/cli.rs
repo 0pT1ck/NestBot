@@ -43,10 +43,7 @@ pub enum Command {
     /// Run Bot, Web, scheduler and local control service.
     Serve,
     /// Sign in to Telegram. Stop the service before login.
-    Login {
-        #[arg(long)]
-        upload: bool,
-    },
+    Login,
     /// Import old encrypted vaults and preferences; old files remain intact.
     ImportLegacy {
         path: PathBuf,
@@ -239,12 +236,12 @@ async fn ask(label: &str, secret: bool) -> anyhow::Result<String> {
     .await?
 }
 
-async fn login(config: &Config, store: Store, upload: bool) -> anyhow::Result<()> {
+async fn login(config: &Config, store: Store) -> anyhow::Result<()> {
     let cancel = tokio_util::sync::CancellationToken::new();
     let account = bounded(
         &cancel,
         config.limits.request_timeout_secs,
-        Account::connect(config, store, if upload { "upload" } else { "main" }),
+        Account::connect(config, store),
     )
     .await?;
     if bounded(&cancel, config.limits.request_timeout_secs, async {
@@ -329,7 +326,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Init
         | Command::Serve
-        | Command::Login { .. }
+        | Command::Login
         | Command::ImportLegacy { .. }
         | Command::Backup { .. } => {
             config.create_dirs()?;
@@ -343,7 +340,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     Ok(())
                 }
                 Command::Serve => crate::serve(config, store).await,
-                Command::Login { upload } => login(&config, store, upload).await,
+                Command::Login => login(&config, store).await,
                 Command::ImportLegacy { path, password_env } => {
                     let password = Config::env_secret(&password_env)
                         .or_else(|| Config::env_secret(&config.web.vault_password_env))

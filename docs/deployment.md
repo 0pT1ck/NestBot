@@ -82,21 +82,19 @@ nano 编辑完成：按 **Ctrl+O** 保存 → **回车**确认文件名 → **Ct
 ~/nestbot/deploy/run-local.sh doctor
 # 初始化加密数据库；已有数据库不会重置
 ~/nestbot/deploy/run-local.sh init
-# 登录第一个账号
+# 登录主账号
 ~/nestbot/deploy/run-local.sh login
-# 可选：登录不同的第二个账号
-~/nestbot/deploy/run-local.sh login --upload
 ```
 
 只有登录命令会询问手机号、验证码及必要的二步验证密码。手机号包含国家区号，例如 `+86...`；验证码可能发到 Telegram App，不一定是短信。输入支持 Ctrl-H 和 DEL 两种退格编码；手机号可见，验证码/二步验证密码按程序提示隐藏。不要把验证码或会话发给别人。
 
-第二账号复用第二/上传会话，只在提取受限时主 → 第二 → 主轮换，搜索与上传选择不变。没有第二账号则保留单账号等待。
+只使用主账号，搜索、提取、下载上传和转发不再选择其他账号。原主账号会话兼容，升级不要求重新登录；旧辅助会话记录保留但不读取。返回等待时间 `x` 时严格等待 `x + 60` 秒后重试，不切账号、不截短长等待，等待可取消。
 
 已经运行的服务必须先停止再登录，避免同时打开同一份账号会话：
 
 ```sh
 ~/nestbot/deploy/run-local.sh shutdown
-~/nestbot/deploy/run-local.sh login --upload
+~/nestbot/deploy/run-local.sh login
 ~/nestbot/deploy/run-local.sh start
 ```
 
@@ -180,6 +178,6 @@ curl -fsSL https://raw.githubusercontent.com/0pT1ck/NestBot/main/deploy/install.
 - 主账号协议任务串行，Bot copy 独立通道；更新/广播/管理缓冲有界，媒体定位先落 SQLite，最多按 10 条读取处理，下载块 512KiB。
 - 默认临时媒体配额 5GiB、单文件上限 4GiB、磁盘保留 256MiB，磁盘与 1GB 内存是两个独立要求；优先 copy。
 - 去重按类型索引，转存与过期清理使用数据库索引。成功且无不确定发送的任务事务性回收临时记录，其他状态保留；保留完成账本、历史、报告和搜索选择。
-- 两账号受限提取轮换遵守冷却、等待可取消；进程重启后从主账号开始。
+- 仅主账号工作；风控返回等待时间 `x` 时等待 `x + 60` 秒后继续，不轮换账号、不截短等待；等待可取消。
 
 真实 Telegram 登录、权限、传输峰值及 0.5 核/1GB 的 72 小时稳定性仍需目标 VPS 实测。开机自启注册及实际服务运行通过 systemd 验证，不将测试虚拟机上的停启检查冒充一次真实 VPS 重启。

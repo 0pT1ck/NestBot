@@ -171,8 +171,7 @@ pub fn rate_wait(text: &str) -> Option<u64> {
                     .ok()
                     .map(|v| v.saturating_mul(if &c[2] == "秒" { 1 } else { 60 }))
             })
-            .unwrap_or(60)
-            .clamp(1, 3600),
+            .unwrap_or(60),
     )
 }
 
@@ -190,8 +189,7 @@ pub fn claim_rate_wait(text: &str) -> Option<u64> {
                     .ok()
                     .map(|n| n.saturating_mul(if &c[2] == "秒" { 1 } else { 60 }))
             })
-            .unwrap_or(60)
-            .clamp(1, u32::MAX as u64),
+            .unwrap_or(60),
     )
 }
 
@@ -255,4 +253,19 @@ pub fn callback_button(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn returned_waits_preserve_zero_long_seconds_and_minutes() {
+        for seconds in [0, 7200, 5_000_000_000u64] {
+            let text = format!("请求频繁，请等待 {seconds} 秒后重试");
+            assert_eq!(super::rate_wait(&text), Some(seconds));
+            assert_eq!(super::claim_rate_wait(&text), Some(seconds));
+        }
+        let text = "请求频繁，请等待 120 分钟后重试";
+        assert_eq!(super::rate_wait(text), Some(7200));
+        assert_eq!(super::claim_rate_wait(text), Some(7200));
+    }
 }

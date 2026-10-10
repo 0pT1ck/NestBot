@@ -2,7 +2,7 @@
 
 面向 0.5 核、1GB Linux VPS 的 Telegram 搜索与转存服务。Bot、CLI 和轻量 Web 共用一个常驻 Rust 进程。
 
-当前实现包含：逐页搜索入夹和续搜、密钥领取与分组按钮、copy/deep 转存、双账号、持久化任务队列、文件级恢复、相册转发聚合、标签、分页管理页面、CLI 本地控制及旧密钥夹导入。
+当前实现包含：逐页搜索入夹和续搜、密钥领取与分组按钮、copy/deep 转存、单账号、持久化任务队列、文件级恢复、相册转发聚合、标签、分页管理页面、CLI 本地控制及旧密钥夹导入。
 
 真实 Telegram 链路和 VPS 资源指标需要在目标环境验收。重传表示下载后重新上传，不保证平台存储物理独立或免于平台清理。
 
@@ -16,8 +16,6 @@ Copy-Item config/secrets.example.env config/secrets.env
 # 修改 TOML 中 api_id、allowed_users、default_target、search_bot、file_bot；填写 secrets.env。
 .\target\release\nestbot.exe --env-file config/secrets.env init
 .\target\release\nestbot.exe --env-file config/secrets.env login
-# 可选第二账号：用于上传，也在主账号提取受限后接手提取；须已加入目标聊天。
-.\target\release\nestbot.exe --env-file config/secrets.env login --upload
 .\target\release\nestbot.exe --env-file config/secrets.env serve
 ```
 
@@ -50,11 +48,11 @@ CLI 搜索默认一页；Bot `/search` 默认搜全页。原 Python 业务规则
 
 搜索和转存的排队消息会持续编辑更新（约每 2 秒，内容未变化时不发送）：搜索显示当前页和总页数，批量转存显示密钥夹内正在处理的密钥序号。搜索、下载、上传或 Bot API 要求等待 `x` 秒时，当前任务显示剩余等待，并在 `x + 60` 秒后自动继续原请求；等待不计入正常超时，`/stop` 可随时取消。普通网络错误不会自动重发不确定的发送。
 
-## 提取账号轮换
+## 单账号与风控等待
 
-先用 `login` 登录第一个（主）账号，再用 `login --upload` 登录不同的第二个账号；已有双账号会话无需重新登录或新增配置。服务从主账号开始提取，文件机器人文字提示、按钮弹窗或提取 RPC 报限流时，第二账号接手重试当前密钥；第二账号受限后再切回主账号。成功后继续使用当前提取账号，不会每个密钥都切换。轮换仅影响密钥提取，搜索、上传和转发的账号选择不变。
+仅使用 `login` 登录的主账号进行搜索、提取、上传和转发；第二账号及 `login --upload` 已删除。主账号原有会话继续使用，无需因升级重新登录；数据库里遗留的旧辅助会话不会被读取或启用，也不会删除用户历史数据。
 
-每个受限账号按提示等待 `x + 60` 秒；切回的账号尚未恢复时等待其剩余冷却时间，不跳过冷却、也不重复增加 60 秒。未登录第二账号时保留单账号等待。中途受限前已收取的媒体先处理并保存完成记录，切换账号重取同一密钥时按媒体 ID 跳过已处理文件，避免跨账号混用私聊消息 ID。`/stop` 可取消冷却等待；服务重启后从主账号重新选择。
+Telegram RPC、Bot API 或文件机器人返回等待时间 `x` 时，严格等待 `x + 60` 秒再继续，不切账号、不将长等待截短，不把返回的 0 秒改为 1 秒。RPC 重试保留原请求及随机 ID；文件机器人文字/按钮限流后重试当前密钥，已完成媒体保留并去重。限流等待不消耗正常请求超时，`/stop` 可取消。没有明确数值的限制提示仍使用既有默认等待值。
 
 ## Bot
 
@@ -76,7 +74,7 @@ curl -fsSL https://raw.githubusercontent.com/0pT1ck/NestBot/main/deploy/install.
 
 默认部署到 `$HOME/nestbot`，自动选择 Linux x86_64/aarch64 静态程序并校验 SHA-256。脚本不询问凭据、不登录账号、不用示例密码初始化数据库；只部署并注册 systemd 后台服务及开机自启。指定目录可用 `sh -s -- --dir /xxx/nestbot`。已有配置、密码、会话和数据保留，下载校验成功后才停止原服务更新。
 
-首次部署后，直接编辑 `config/nestbot.toml`（API ID、白名单、目标、机器人名称）和 `config/secrets.env`（API Hash、Bot Token、两种密码等）。再执行 `~/nestbot/deploy/run-local.sh init`、`login`、可选的 `login --upload`，最后 `start`。手机号、验证码、二步验证密码仅由独立登录命令询问，支持 Ctrl-H/DEL 退格；两个账号共用一组 API ID/Hash。
+首次部署后，直接编辑 `config/nestbot.toml`（API ID、白名单、目标、机器人名称）和 `config/secrets.env`（API Hash、Bot Token、两种密码等）。再执行 `~/nestbot/deploy/run-local.sh init`、`login`，最后 `start`。手机号、验证码、二步验证密码仅由独立登录命令询问，支持 Ctrl-H/DEL 退格；只登录主账号。
 
 业务文件仍在安装目录；开机自启会额外安装 `/etc/systemd/system/nestbot.service` 及启用链接，服务状态和管理记录属于系统。应用日志留在 `.local/log/nestbot.log`。systemd 异常退出重启，CPU 限制 50%、内存硬上限 512MiB；不自动轮转日志。新安装缺少主密钥时暂不启动，完成配置后启动即可在以后开机自动运行。
 

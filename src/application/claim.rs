@@ -18,15 +18,6 @@ struct Collector {
     stop: CancellationToken,
 }
 
-#[derive(Debug)]
-struct BotRateLimit(u64);
-impl std::fmt::Display for BotRateLimit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("bot_rate_limited")
-    }
-}
-impl std::error::Error for BotRateLimit {}
-
 struct Collected {
     count: u32,
     limited: Option<u64>,
@@ -40,14 +31,6 @@ fn collected_error(count: u32, error: anyhow::Error) -> anyhow::Result<Collected
         })
     } else {
         Err(error)
-    }
-}
-
-fn extraction_error(error: anyhow::Error) -> anyhow::Error {
-    if let Some(limit) = error.downcast_ref::<RetryLater>() {
-        BotRateLimit(limit.seconds).into()
-    } else {
-        error
     }
 }
 
@@ -394,17 +377,16 @@ async fn once(
     batch: Option<(&str, u32)>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<(ClaimStats, Option<u64>)> {
-    let sender = app.users.sender(cancel).await?;
+    let sender = &account;
     let timeout = app.config.limits.request_timeout_secs;
-    let peer = crate::telegram::extraction_scope(bounded(
+    let peer = bounded(
         cancel,
         timeout,
         account.resolve(&app.config.telegram.file_bot),
-    ))
-    .await
-    .map_err(extraction_error)?;
+    )
+    .await?;
     let destination = bounded(cancel, timeout, sender.resolve(target)).await?;
-    let identity = crate::telegram::extraction_scope(bounded(cancel, timeout, async {
+    let identity = bounded(cancel, timeout, async {
         Ok(account
             .client
             .get_me()
@@ -412,9 +394,8 @@ async fn once(
             .map_err(rpc)?
             .id()
             .bot_api_dialog_id_unchecked())
-    }))
-    .await
-    .map_err(extraction_error)?;
+    })
+    .await?;
     // Private message IDs and album groups are local to the extraction account.
     let claim = app
         .store
@@ -426,35 +407,31 @@ async fn once(
     );
     app.store.reset_inbox(&job.summary.id, &claim).await?;
     let receiver = account.messages.subscribe();
-    let sent = crate::telegram::extraction_scope(bounded(cancel, timeout, async {
+    let sent = bounded(cancel, timeout, async {
         account
             .client
             .send_message(peer, format!("/start {payload}"))
             .await
             .map_err(rpc)
-    }))
-    .await
-    .map_err(extraction_error)?;
-    let stop = cancel.child_token();
-    let mut collector = crate::telegram::extraction_scope(async {
-        Collector {
-            task: tokio::spawn(crate::telegram::inherit_flood_context(collect(
-                account.clone(),
-                app.store.clone(),
-                job.summary.id.clone(),
-                claim.clone(),
-                peer,
-                sent.id(),
-                expected,
-                app.config.limits.claim_timeout_secs,
-                timeout,
-                stop.clone(),
-                receiver,
-            ))),
-            stop,
-        }
     })
-    .await;
+    .await?;
+    let stop = cancel.child_token();
+    let mut collector = Collector {
+        task: tokio::spawn(crate::telegram::inherit_flood_context(collect(
+            account.clone(),
+            app.store.clone(),
+            job.summary.id.clone(),
+            claim.clone(),
+            peer,
+            sent.id(),
+            expected,
+            app.config.limits.claim_timeout_secs,
+            timeout,
+            stop.clone(),
+            receiver,
+        ))),
+        stop,
+    };
     let mut count = 0;
     let mut stats = ClaimStats::default();
     let collected = (&mut collector.task).await??;
@@ -505,7 +482,7 @@ async fn once(
                 transfer::album(
                     app,
                     job,
-                    &sender,
+                    sender,
                     destination,
                     &pending,
                     &scope,
@@ -541,7 +518,7 @@ async fn once(
                         app,
                         job,
                         &account,
-                        &sender,
+                        sender,
                         destination,
                         &message,
                         &scope,
@@ -647,10 +624,8 @@ pub async fn run(
         app.store.claim_record(payload).await?
     };
     loop {
-        let mut upload = false;
         let result = async {
-            let (selected, account) = app.users.extraction_account(cancel).await?;
-            upload = selected;
+            let account = app.users.account(cancel).await?;
             once(
                 app,
                 job,
@@ -669,11 +644,11 @@ pub async fn run(
         }
         .await;
         match result {
-            Err(error) if error.downcast_ref::<BotRateLimit>().is_some() => {
-                let seconds = error.downcast_ref::<BotRateLimit>().unwrap().0.max(1);
+            Err(error) if error.downcast_ref::<RetryLater>().is_some() => {
+                let seconds = error.downcast_ref::<RetryLater>().unwrap().seconds;
                 app.progress(&job.summary.id, "claim_waiting", 0, expected.map(u64::from))
                     .await?;
-                app.users.extraction_limited(upload, seconds).await?;
+                crate::telegram::wait_flood(cancel, seconds).await?;
             }
             Ok((stats, Some(seconds))) => {
                 let mut report = app.store.report(&job.summary.id).await?;
@@ -682,7 +657,7 @@ pub async fn run(
                 app.store.save_report(&job.summary.id, &report).await?;
                 app.progress(&job.summary.id, "claim_waiting", 0, expected.map(u64::from))
                     .await?;
-                app.users.extraction_limited(upload, seconds).await?;
+                crate::telegram::wait_flood(cancel, seconds).await?;
                 if stats.failed > 0 {
                     let mut report = app.store.report(&job.summary.id).await?;
                     report.failed_keys += 1;
@@ -710,7 +685,6 @@ pub async fn run(
                     Ok((_, Some(_))) => unreachable!("limited attempts handled above"),
                     Err(error) => {
                         if cancel.is_cancelled()
-                            || error.downcast_ref::<RetryLater>().is_some()
                             || app.store.has_uncertain(&job.summary.id).await?
                             || error.chain().any(|e| e.is::<rusqlite::Error>())
                         {

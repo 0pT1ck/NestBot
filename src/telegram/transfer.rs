@@ -512,8 +512,8 @@ pub async fn incoming(
         .await?;
         Ok(())
     } else {
-        let account = app.users.account(false, cancel).await?;
-        let sender = app.users.sender(cancel).await?;
+        let account = app.users.account(cancel).await?;
+        let sender = &account;
         let bot = app
             .bot
             .as_ref()
@@ -556,7 +556,7 @@ pub async fn incoming(
                 app,
                 job,
                 &account,
-                &sender,
+                sender,
                 target_peer,
                 &message,
                 &scope,

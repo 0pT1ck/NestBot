@@ -625,16 +625,45 @@ async fn encrypted_sessions_persist_auth_keys_without_external_sqlite_runtime() 
     use grammers_session::Session;
     use nestbot::telegram::session::EncryptedSession;
     let (_dir, store) = fixture(4);
-    let session = EncryptedSession::open(store.clone(), "main").await.unwrap();
+    let session = EncryptedSession::open(store.clone()).await.unwrap();
     session.set_home_dc_id(5).await.unwrap();
     let mut dc = session.dc_option(5).unwrap().unwrap();
     dc.auth_key = Some([7; 256]);
     session.set_dc_option(&dc).await.unwrap();
-    let reopened = EncryptedSession::open(store, "main").await.unwrap();
+    let reopened = EncryptedSession::open(store).await.unwrap();
     assert_eq!(reopened.home_dc_id().unwrap(), 5);
     assert_eq!(
         reopened.dc_option(5).unwrap().unwrap().auth_key,
         Some([7; 256])
+    );
+}
+
+#[tokio::test]
+async fn single_account_reads_existing_main_auth_and_ignores_obsolete_secondary_session() {
+    use grammers_session::{Session, SessionData};
+    use nestbot::telegram::session::EncryptedSession;
+    let (_dir, store) = fixture(4);
+    let mut defaults = SessionData::default();
+    let mut dc = defaults.dc_options.remove(&5).unwrap();
+    dc.auth_key = Some([9; 256]);
+    let legacy = serde_json::json!({
+        "home": 5,
+        "dcs": [dc],
+        "updates": defaults.updates_state,
+    });
+    store
+        .set_preference("session:main:header", &legacy.to_string())
+        .await
+        .unwrap();
+    store
+        .set_preference("session:upload:header", "obsolete-invalid-session")
+        .await
+        .unwrap();
+    let session = EncryptedSession::open(store).await.unwrap();
+    assert_eq!(session.home_dc_id().unwrap(), 5);
+    assert_eq!(
+        session.dc_option(5).unwrap().unwrap().auth_key,
+        Some([9; 256])
     );
 }
 

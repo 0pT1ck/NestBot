@@ -771,7 +771,7 @@ pub async fn command(
             }
             if target.trim_start_matches('-').len()<6 || target.parse::<i64>().is_err(){return Ok("用法：/bind 群ID 或 /bind reset。".into());}
             app.store.set_preference("target",target).await?;
-            let mut note=format!("已绑定目标：{target}。请确认上传账号已加入目标。");
+            let mut note=format!("已绑定目标：{target}。请确认主账号已加入目标并有发送权限。");
             if let Some(bot)=&app.bot && bot.get_chat(recipient(target)).await.is_err() {note.push_str("Bot 暂时无法访问该目标；copy 媒体需将 Bot 加入频道并授予发消息权限。");}
             Ok(note)
         },
@@ -820,7 +820,7 @@ pub async fn command(
         },
         "/chats"=>{
             let token=app.shutdown.child_token();
-            let account=app.users.account(false,&token).await?;let mut dialogs=account.client.iter_dialogs();let mut lines=vec![];
+            let account=app.users.account(&token).await?;let mut dialogs=account.client.iter_dialogs();let mut lines=vec![];
             while let Some(dialog)=crate::telegram::bounded(&token,app.config.limits.request_timeout_secs,async {dialogs.next().await.map_err(crate::telegram::rpc)}).await? {
                 let peer=dialog.peer();if matches!(peer,grammers_client::peer::Peer::User(_)){continue;}lines.push(format!("{} {}",peer.id().bot_api_dialog_id_unchecked(),peer.name().unwrap_or("")));
             }

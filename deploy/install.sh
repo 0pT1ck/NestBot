@@ -17,7 +17,6 @@ show_commands() {
     printf '编辑凭据及密码：nano "%s/config/secrets.env"\n' "$ROOT"
     printf '首次初始化："%s/deploy/run-local.sh" init\n' "$ROOT"
     printf '登录主账号："%s/deploy/run-local.sh" login\n' "$ROOT"
-    printf '登录第二账号："%s/deploy/run-local.sh" login --upload\n' "$ROOT"
     printf '配置登录完成后启动："%s/deploy/run-local.sh" start\n' "$ROOT"
     printf '状态："%s/deploy/run-local.sh" status\n' "$ROOT"
     printf '停止："%s/deploy/run-local.sh" shutdown\n' "$ROOT"
