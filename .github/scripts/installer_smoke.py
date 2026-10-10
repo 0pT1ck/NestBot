@@ -3,12 +3,14 @@
 import functools
 import hashlib
 import http.server
+import io
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -128,6 +130,20 @@ with tempfile.TemporaryDirectory(prefix="nb-smoke.", dir="/tmp") as temporary:
         before = pid()
         run(command, env=env, ok=False)
         assert pid() == before, "Failed checksum stopped the running service"
+        assert (root / "nestbot").read_bytes() == before_binary
+        assert all(p.read_bytes() == content for p, content in originals.items())
+        # A correctly checksummed package can still be an incompatible older layout.
+        with tarfile.open(ARCHIVE, "r:gz") as source, tarfile.open(public / ARCHIVE.name, "w:gz") as destination:
+            for member in source.getmembers():
+                content = source.extractfile(member) if member.isfile() else None
+                if member.name == "deploy/package-version":
+                    content = io.BytesIO(b"nohup-0\n")
+                    member.size = len(content.getvalue())
+                destination.addfile(member, content)
+        incompatible_digest = hashlib.sha256((public / ARCHIVE.name).read_bytes()).hexdigest()
+        checksum.write_text(f"{incompatible_digest}  {ARCHIVE.name}\n")
+        run(command, env=env, ok=False)
+        assert pid() == before, "Incompatible package stopped the running service"
         assert (root / "nestbot").read_bytes() == before_binary
         assert all(p.read_bytes() == content for p, content in originals.items())
         assert not list((root / ".local/tmp").glob("install.*"))

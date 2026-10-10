@@ -75,9 +75,11 @@ main() {
     (cd "$STAGE" && printf '%s  %s\n' "$digest" "$ASSET" | sha256sum -c -) || fail '程序包校验失败，原服务和文件未改动。'
     mkdir "$STAGE/unpacked"
     tar -xzf "$STAGE/$ASSET" -C "$STAGE/unpacked"
-    for file in nestbot deploy/run-local.sh config/nestbot.example.toml config/secrets.example.env; do
+    for file in nestbot deploy/run-local.sh deploy/package-version config/nestbot.example.toml config/secrets.example.env; do
         [ -f "$STAGE/unpacked/$file" ] || fail "发布包缺少 $file。"
     done
+    IFS= read -r package_version < "$STAGE/unpacked/deploy/package-version" || fail '发布包版本信息损坏。'
+    [ "$package_version" = systemd-1 ] || fail '公开 Release 与此安装入口不兼容，请等待新版发布；原服务及配置未改动。'
     # Stop only after the complete package has passed verification.
     if [ -n "$existing" ]; then privileged systemctl stop nestbot.service; fi
     # One-time cutover from the previous nohup launcher; it checks PID ownership.
