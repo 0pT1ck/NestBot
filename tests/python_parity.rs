@@ -18,7 +18,7 @@ fn fixture() -> (tempfile::TempDir, Store) {
 }
 
 #[test]
-fn original_python_function_outputs_match_all_48_synthetic_cases() {
+fn original_python_function_outputs_match_supported_synthetic_cases() {
     let fixture: Value =
         serde_json::from_str(include_str!("fixtures/python-behavior.json")).unwrap();
     for case in fixture["cases"].as_array().unwrap() {
@@ -55,7 +55,6 @@ fn original_python_function_outputs_match_all_48_synthetic_cases() {
                     .unwrap()
                     .complete(serde_json::from_value(input["expected"].clone()).unwrap())
             ),
-            "claim_wait" => json!(parser::claim_rate_wait(input.as_str().unwrap())),
             other => panic!("unknown reference case {other}"),
         };
         assert_eq!(actual, case["expected"], "{} input {}", case["kind"], input);

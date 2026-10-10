@@ -141,12 +141,14 @@ impl RetryPolicy for TelegramFloodSleep {
         let InvocationError::Rpc(error) = &ctx.error else {
             return ControlFlow::Break(());
         };
-        let seconds = error.value.unwrap_or(60) as u64;
         // Telegram definitively rejected this RPC. Grammers retries its original
         // serialized request, preserving random IDs; ambiguous failures never retry.
         if error.code != 420 {
             return ControlFlow::Break(());
         }
+        let Some(seconds) = error.value.map(u64::from) else {
+            return ControlFlow::Break(());
+        };
         let delay = flood_delay(seconds);
         tracing::warn!(
             event = "telegram_flood_wait",
@@ -167,12 +169,15 @@ impl std::fmt::Display for TelegramRejected {
 impl std::error::Error for TelegramRejected {}
 
 pub fn rpc(error: InvocationError) -> anyhow::Error {
-    match error {
-        InvocationError::Rpc(ref e) if e.code == 420 => RetryLater {
-            seconds: e.value.unwrap_or(60) as u64,
-        }
-        .into(),
-        InvocationError::Rpc(ref e) if (400..500).contains(&e.code) => TelegramRejected.into(),
+    match &error {
+        InvocationError::Rpc(e) if e.code == 420 => match e.value {
+            Some(seconds) => RetryLater {
+                seconds: u64::from(seconds),
+            }
+            .into(),
+            None => TelegramRejected.into(),
+        },
+        InvocationError::Rpc(e) if (400..500).contains(&e.code) => TelegramRejected.into(),
         _ => anyhow::anyhow!("telegram_failed"),
     }
 }
@@ -599,5 +604,40 @@ mod flood_tests {
                 u64::from(seconds)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod untimed_flood_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn missing_rpc_wait_time_returns_an_error_without_inventing_a_countdown() {
+        let error = || {
+            InvocationError::Rpc(grammers_mtsender::RpcError {
+                code: 420,
+                name: "FLOOD_WAIT".into(),
+                value: None,
+                caused_by: None,
+            })
+        };
+        let (events, notices) = watch::channel(None);
+        flood_scope(
+            events,
+            bounded(&CancellationToken::new(), 2, async {
+                let context = RetryContext {
+                    fail_count: std::num::NonZeroU32::new(1).unwrap(),
+                    slept_so_far: Duration::ZERO,
+                    error: error(),
+                };
+                assert!(TelegramFloodSleep.should_retry(&context).is_break());
+                assert_eq!(flood_waited(), Duration::ZERO);
+                assert!(notices.borrow().is_none());
+                assert!(rpc(error()).is::<TelegramRejected>());
+                Ok(())
+            }),
+        )
+        .await
+        .unwrap();
     }
 }

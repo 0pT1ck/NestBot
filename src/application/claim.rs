@@ -235,7 +235,7 @@ async fn collect(
                 }
             }
             if message.media().is_none()
-                && let Some(seconds) = parser::claim_rate_wait(message.text())
+                && let Some(seconds) = parser::rate_wait(message.text())
             {
                 limited = Some(seconds);
             }
@@ -281,7 +281,7 @@ async fn collect(
                 };
             for message in refreshed {
                 if message.media().is_none()
-                    && let Some(seconds) = parser::claim_rate_wait(message.text())
+                    && let Some(seconds) = parser::rate_wait(message.text())
                 {
                     return Ok(Collected {
                         count,
@@ -327,7 +327,7 @@ async fn collect(
                 .await;
                 match result {
                     Ok(Some(answer)) => {
-                        if let Some(seconds) = parser::claim_rate_wait(&answer) {
+                        if let Some(seconds) = parser::rate_wait(&answer) {
                             return Ok(Collected {
                                 count,
                                 limited: Some(seconds),

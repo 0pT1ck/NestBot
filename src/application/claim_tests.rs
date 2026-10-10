@@ -551,3 +551,28 @@ async fn nonlimit_callback_error_keeps_existing_partial_result() {
         vec![1]
     );
 }
+
+#[tokio::test]
+async fn processing_reply_and_callback_do_not_interrupt_the_first_key() {
+    let mut hint = message(1, Some("全部获取"), false);
+    let enums::Message::Message(raw) = &mut hint.raw else {
+        panic!("expected message");
+    };
+    raw.message = "正在处理，请稍候".into();
+    let source = Replay::new(vec![hint], vec![(2, vec![message(2, None, true)])]);
+    source
+        .answers
+        .lock()
+        .await
+        .push_back(Ok(Some("正在获取文件，请稍后".into())));
+    let (collected, store, _dir) = replay_attempt(source, Some(1), 60).await;
+    assert_eq!(collected.limited, None);
+    assert_eq!(collected.count, 1);
+    assert_eq!(
+        store
+            .inbox_next("synthetic-job", "synthetic-claim")
+            .await
+            .unwrap(),
+        vec![2]
+    );
+}

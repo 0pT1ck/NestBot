@@ -135,62 +135,40 @@ pub fn parse_search(text: &str, links: &HashMap<usize, String>) -> SearchPage {
 }
 
 pub fn rate_wait(text: &str) -> Option<u64> {
-    // Processing placeholders are not throttling notices. Require either an
-    // explicit rate-limit signal or a timed instruction to retry later.
+    // A progress/permission notice must not manufacture a cooldown. Require
+    // a supplied duration together with rate-limit or postponed-retry meaning.
+    let duration = WAIT.captures(text)?;
     let lower = text.to_lowercase();
     let explicit = [
-        "频繁",
+        "请求频繁",
+        "请求过于频繁",
+        "请求太频繁",
+        "操作频繁",
+        "操作过于频繁",
+        "操作太频繁",
         "限流",
-        "次数限制",
-        "速率限制",
-        "请求限制",
-        "暂时无法",
-        "稍后再试",
-        "稍后重试",
-        "稍候重试",
         "too many requests",
         "flood_wait",
         "rate limit",
     ]
     .iter()
-    .any(|s| lower.contains(s));
-    let timed_retry = WAIT.is_match(text)
-        && ["重试", "再试", "后再", "稍后", "等待"]
-            .iter()
-            .any(|s| text.contains(s))
-        && !["处理中", "正在搜索", "正在处理", "正在获取", "正在发送"]
-            .iter()
-            .any(|s| text.contains(s));
-    if !explicit && !timed_retry {
-        return None;
-    }
-    Some(
-        WAIT.captures(text)
-            .and_then(|c| {
-                c[1].parse::<u64>()
-                    .ok()
-                    .map(|v| v.saturating_mul(if &c[2] == "秒" { 1 } else { 60 }))
-            })
-            .unwrap_or(60),
-    )
-}
-
-pub fn claim_rate_wait(text: &str) -> Option<u64> {
-    if !["暂时", "稍后", "稍候", "请重试", "频繁", "限制", "请稍"]
+    .any(|signal| lower.contains(signal));
+    let processing = ["处理中", "正在搜索", "正在处理", "正在获取", "正在发送"]
         .iter()
-        .any(|s| text.contains(s))
-    {
+        .any(|signal| text.contains(signal));
+    let retry = ["重试", "再试", "后再", "稍后", "等待"]
+        .iter()
+        .any(|signal| text.contains(signal));
+    let unavailable = ["暂时无法", "暂时限制", "暂时受限"]
+        .iter()
+        .any(|signal| text.contains(signal));
+    if !explicit && (processing || !(retry || unavailable)) {
         return None;
     }
-    Some(
-        WAIT.captures(text)
-            .and_then(|c| {
-                c[1].parse::<u64>()
-                    .ok()
-                    .map(|n| n.saturating_mul(if &c[2] == "秒" { 1 } else { 60 }))
-            })
-            .unwrap_or(60),
-    )
+    duration[1]
+        .parse::<u64>()
+        .ok()
+        .map(|seconds| seconds.saturating_mul(if &duration[2] == "秒" { 1 } else { 60 }))
 }
 
 pub fn no_search_results(text: &str) -> bool {
@@ -262,10 +240,39 @@ mod tests {
         for seconds in [0, 7200, 5_000_000_000u64] {
             let text = format!("请求频繁，请等待 {seconds} 秒后重试");
             assert_eq!(super::rate_wait(&text), Some(seconds));
-            assert_eq!(super::claim_rate_wait(&text), Some(seconds));
         }
         let text = "请求频繁，请等待 120 分钟后重试";
         assert_eq!(super::rate_wait(text), Some(7200));
-        assert_eq!(super::claim_rate_wait(text), Some(7200));
+    }
+}
+
+#[cfg(test)]
+mod notice_tests {
+    #[test]
+    fn progress_permissions_and_untimed_notices_do_not_start_a_cooldown() {
+        for text in [
+            "请稍候",
+            "正在处理，请稍候",
+            "正在获取文件，请稍后",
+            "正在处理，预计等待 10 秒",
+            "正在处理，预计 10 秒后重试",
+            "此功能仅会员可用，普通账号次数限制；视频时长 60 秒",
+            "请求过于频繁，请稍后再试",
+        ] {
+            assert_eq!(super::rate_wait(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn explicit_timed_restrictions_and_retries_preserve_the_supplied_duration() {
+        for (text, seconds) in [
+            ("请求频繁，请稍后60秒重试", 60),
+            ("暂时限制，请稍后120秒重试", 120),
+            ("暂时无法领取，等待 30 分钟", 1800),
+            ("请等待 1048 秒后重试", 1048),
+            ("正在处理\n请求频繁，请等待 7200 秒后重试", 7200),
+        ] {
+            assert_eq!(super::rate_wait(text), Some(seconds), "{text}");
+        }
     }
 }

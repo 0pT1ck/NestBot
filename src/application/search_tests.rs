@@ -9,6 +9,7 @@ enum ErrorMode {
     New,
     Edited,
     Popup,
+    TimedPopup,
     Silent,
     Forever,
     Delayed(Duration),
@@ -57,6 +58,9 @@ impl PageSource for RetryBot {
         if attempt == 1 || matches!(self.mode, ErrorMode::Forever) {
             if matches!(self.mode, ErrorMode::Popup) {
                 return Ok(Some("❌ 发生错误，请稍后重试".into()));
+            }
+            if matches!(self.mode, ErrorMode::TimedPopup) {
+                return Ok(Some("请求频繁，请等待 120 秒后重试".into()));
             }
             let mut error = message("❌ 发生错误，请稍后重试");
             if !matches!(self.mode, ErrorMode::Edited) {
@@ -825,4 +829,26 @@ async fn sorting_allows_replacing_entries_on_the_same_page() {
     .unwrap()
     .unwrap();
     assert!(received.text().contains("synthetic-sorted"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn timed_callback_restriction_uses_returned_time_instead_of_generic_search_delay() {
+    let (_dir, app) = retry_fixture();
+    let job = retry_job(&app).await;
+    let started = Instant::now();
+    let (result, _) = replay_retry(
+        &app,
+        &job,
+        ErrorMode::TimedPopup,
+        Some(2),
+        &CancellationToken::new(),
+    )
+    .await;
+    result.unwrap();
+    assert!(started.elapsed() >= Duration::from_secs(180));
+    assert!(started.elapsed() < Duration::from_secs(190));
+    assert_eq!(
+        app.store.report(&job.summary.id).await.unwrap().search_page,
+        Some(52)
+    );
 }

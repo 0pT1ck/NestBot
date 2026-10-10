@@ -184,6 +184,11 @@ fn processing(text: &str) -> bool {
         .any(|s| text.contains(s))
 }
 
+fn retryable_search_error(text: &str) -> bool {
+    ["错误", "失败"].iter().any(|signal| text.contains(signal))
+        && ["重试", "再试"].iter().any(|signal| text.contains(signal))
+}
+
 fn settle(
     candidate: &mut Option<(Message, PageState, Instant)>,
     message: Message,
@@ -788,7 +793,12 @@ async fn paginate(
         if answer.as_deref().is_some_and(parser::search_end) {
             break;
         }
-        let next = if answer.as_deref().and_then(parser::rate_wait).is_some() {
+        if let Some(seconds) = answer.as_deref().and_then(parser::rate_wait) {
+            crate::telegram::wait_flood(cancel, seconds).await?;
+            first = true;
+            continue;
+        }
+        let next = if answer.as_deref().is_some_and(retryable_search_error) {
             Some(reply.clone())
         } else {
             match wait_page(
@@ -817,6 +827,11 @@ async fn paginate(
         let Some(next) = next else {
             break;
         };
+        if let Some(seconds) = parser::rate_wait(next.text()) {
+            crate::telegram::wait_flood(cancel, seconds).await?;
+            first = true;
+            continue;
+        }
         if parse(&next).entries.is_empty() || next.raw == reply.raw {
             retries += 1;
             if retries > SEARCH_RETRY_LIMIT {

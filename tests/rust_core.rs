@@ -796,7 +796,6 @@ fn processing_notices_are_not_limits_and_empty_search_is_recognized() {
     ] {
         assert_eq!(parser::rate_wait(text), None, "{text}");
     }
-    assert_eq!(parser::rate_wait("请求过于频繁，请稍后再试"), Some(60));
     assert_eq!(parser::rate_wait("请等待 1048 秒后重试"), Some(1048));
     assert!(parser::no_search_results(
         "🔎 搜索词：synthetic\n🔍 未找到相关结果"

@@ -425,31 +425,6 @@
         "expected": 3
       },
       "expected": true
-    },
-    {
-      "kind": "claim_wait",
-      "input": "请等待 1048 秒后重试",
-      "expected": null
-    },
-    {
-      "kind": "claim_wait",
-      "input": "暂时无法领取，等待 30 分钟",
-      "expected": 1800
-    },
-    {
-      "kind": "claim_wait",
-      "input": "请稍候",
-      "expected": 60
-    },
-    {
-      "kind": "claim_wait",
-      "input": "正在处理，请稍候",
-      "expected": 60
-    },
-    {
-      "kind": "claim_wait",
-      "input": "普通消息",
-      "expected": null
     }
   ]
 }
