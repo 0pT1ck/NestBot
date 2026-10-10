@@ -220,13 +220,21 @@ async fn ask(label: &str, secret: bool) -> anyhow::Result<String> {
         // default prompt writes UTF-8 bytes to CONOUT$, which may use a legacy code page.
         print!("{label}");
         std::io::stdout().flush()?;
-        if secret {
-            Ok(rpassword::read_password()?)
+        // Use the existing raw-mode reader for both visible and hidden input:
+        // it handles Ctrl-H and DEL independently of the terminal's erase setting.
+        let builder = rpassword::ConfigBuilder::new();
+        let builder = if secret {
+            builder.password_feedback_hide()
         } else {
-            let mut value = String::new();
-            std::io::stdin().read_line(&mut value)?;
-            Ok(value.trim().into())
+            builder.password_feedback_partial_mask('*', usize::MAX)
+        };
+        let mut value = rpassword::read_password_with_config(builder.build())?;
+        if !secret {
+            value.truncate(value.trim_end().len());
+            let leading = value.len() - value.trim_start().len();
+            value.drain(..leading);
         }
+        Ok(value)
     })
     .await?
 }
@@ -466,5 +474,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&data)?);
             Ok(())
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod terminal_tests {
+    #[tokio::test]
+    #[ignore = "requires a controlling terminal; run by terminal_smoke.py"]
+    async fn terminal_backspace_smoke() {
+        assert_eq!(super::ask("VISIBLE>", false).await.unwrap(), "+86123456");
+        assert_eq!(
+            super::ask("HIDDEN>", true).await.unwrap(),
+            "smoke-secret-123"
+        );
     }
 }

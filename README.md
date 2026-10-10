@@ -68,17 +68,19 @@ CLI 搜索默认一页；Bot `/search` 默认搜全页。原 Python 业务规则
 
 ## Linux 部署
 
-在 SSH 终端以拥有安装目录的用户执行，无需克隆、编译或 `sudo`：
+在 systemd Linux 的 SSH 终端执行，无需克隆或编译；普通用户先执行 `sudo -v` 授权服务注册，root 无需：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/0pT1ck/NestBot/main/deploy/install.sh | sh
 ```
 
-默认安装到 `$HOME/nestbot`，自动选择 Linux x86_64/aarch64 静态程序，校验 SHA-256，交互填写配置、登录账号并后台启动。指定目录可在末尾改用 `sh -s -- --dir /xxx/nestbot`；该目录须可写。已有配置、凭据和主密钥不覆盖，运行中的服务不替换。
+默认部署到 `$HOME/nestbot`，自动选择 Linux x86_64/aarch64 静态程序并校验 SHA-256。脚本不询问凭据、不登录账号、不用示例密码初始化数据库；只部署并注册 systemd 后台服务及开机自启。指定目录可用 `sh -s -- --dir /xxx/nestbot`。已有配置、密码、会话和数据保留，下载校验成功后才停止原服务更新。
 
-程序、配置、数据库、账号会话、缓存、临时文件和日志均保留在安装目录，不创建系统用户、不注册 systemd、不写入 `/etc`、`/usr/local` 或 `/var`。操作系统自己的 SSH 日志、swap 等不属于程序数据。后台运行可在退出 SSH 后继续，但不自动开机启动、故障重启或轮转日志，也没有 systemd 硬性资源限额。
+首次部署后，直接编辑 `config/nestbot.toml`（API ID、白名单、目标、机器人名称）和 `config/secrets.env`（API Hash、Bot Token、两种密码等）。再执行 `~/nestbot/deploy/run-local.sh init`、`login`、可选的 `login --upload`，最后 `start`。手机号、验证码、二步验证密码仅由独立登录命令询问，支持 Ctrl-H/DEL 退格；两个账号共用一组 API ID/Hash。
 
-启动、状态、停止和重启分别使用 `~/nestbot/deploy/run-local.sh start`、`status`、`shutdown`、`restart`。`stop` 仍只停止任务。账号登录与更新前先 `shutdown`。完整的新手说明、凭据准备、SSH 隧道和更新方式见 [部署说明](docs/deployment.md)。
+业务文件仍在安装目录；开机自启会额外安装 `/etc/systemd/system/nestbot.service` 及启用链接，服务状态和管理记录属于系统。应用日志留在 `.local/log/nestbot.log`。systemd 异常退出重启，CPU 限制 50%、内存硬上限 512MiB；不自动轮转日志。新安装缺少主密钥时暂不启动，完成配置后启动即可在以后开机自动运行。
+
+启动、状态、停止、重启使用 `deploy/run-local.sh start`、`status`、`shutdown`、`restart`；`stop` 仍只停止任务。登录前先停服，不要另起 nohup/serve 实例。完整编辑步骤、登录、自启、备份和 SSH 隧道见 [部署说明](docs/deployment.md)。
 
 启动时自动补齐转存状态及过期记录查询索引。任务确认完成且没有不确定发送后，回收该任务的临时收取记录和任务内去重记录；启动恢复时也回收历史已完成且没有不确定发送任务的这些数据，并清理过期按钮与超过 7 天的 Bot 更新记录。失败、取消及需核对任务的恢复数据保留；完成账本、任务历史、报告和搜索选择范围不删除。旧密钥完成记录的 JSON 格式保持兼容。
 
