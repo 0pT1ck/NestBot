@@ -103,17 +103,19 @@ main() {
     chmod +x nestbot deploy/install.sh deploy/run-local.sh
     touch .local/log/nestbot.log
     escaped=$(unit_path "$ROOT")
+    # Single-path directives do not strip argument quotes; only escape specifiers.
+    raw_path=$(printf '%s' "$ROOT" | sed 's/%/%%/g')
     cat > "$STAGE/nestbot.service" <<EOF
 [Unit]
 Description=NestBot Telegram service
 Wants=network-online.target
 After=network-online.target
-ConditionPathExists="$escaped/.local/data/master.key"
+ConditionPathExists=$raw_path/.local/data/master.key
 
 [Service]
 Type=exec
 User=$(id -u)
-WorkingDirectory="$escaped"
+WorkingDirectory=$raw_path
 ExecStartPre="$escaped/deploy/run-local.sh" doctor
 ExecStart="$escaped/deploy/run-local.sh" serve
 Restart=on-failure
@@ -127,8 +129,8 @@ MemoryMax=512M
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths="$escaped"
-StandardOutput=append:$escaped/.local/log/nestbot.log
-StandardError=append:$escaped/.local/log/nestbot.log
+StandardOutput=append:$raw_path/.local/log/nestbot.log
+StandardError=append:$raw_path/.local/log/nestbot.log
 
 [Install]
 WantedBy=multi-user.target

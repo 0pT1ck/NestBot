@@ -27,6 +27,7 @@ def controlling_terminal():
 
 
 child = subprocess.Popen([executables[0], "terminal_backspace_smoke", "--ignored", "--nocapture"], stdin=slave, stdout=slave, stderr=slave, preexec_fn=controlling_terminal)
+os.close(slave)
 output = bytearray()
 try:
     def until(marker):
@@ -39,7 +40,7 @@ try:
 
     def send(payload):
         deadline = time.monotonic() + 10
-        while termios.tcgetattr(slave)[3] & termios.ICANON:
+        while termios.tcgetattr(master)[3] & termios.ICANON:
             assert time.monotonic() < deadline, "Prompt did not enter raw mode"
             time.sleep(0.01)
         os.write(master, payload)
@@ -51,12 +52,11 @@ try:
     until(b"test result:")
     assert child.wait(timeout=30) == 0, output.decode(errors="replace")
     assert b"smoke-secret" not in output and b"smoke-secrex" not in output, "Hidden input appeared in terminal output"
-    assert termios.tcgetattr(slave) == expected_settings, "Reader did not restore terminal settings"
+    assert termios.tcgetattr(master) == expected_settings, "Reader did not restore terminal settings"
     print("PASS: actual CLI visible/hidden prompts accept Ctrl-H and DEL, trim phone whitespace, hide secrets and restore terminal settings")
 finally:
     if child.poll() is None:
         child.kill()
         child.wait(timeout=30)
-    termios.tcsetattr(slave, termios.TCSANOW, original)
+    termios.tcsetattr(master, termios.TCSANOW, original)
     os.close(master)
-    os.close(slave)

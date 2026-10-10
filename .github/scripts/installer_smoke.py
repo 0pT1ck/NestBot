@@ -143,6 +143,16 @@ with tempfile.TemporaryDirectory(prefix="nb-smoke.", dir="/tmp") as temporary:
                 events.append(entry.get("fields", {}).get("event"))
         assert "service_started" in events, "Application startup was not logged inside the installation directory"
         print("PASS: noninteractive deployment without initialization, boot enablement, manual config/init, actual systemd start/status, directory-local temp/logs, duplicate start, preserving update, crash restart, stop/start after manager reload, checksum failure leaves running service/config/key intact")
+    except BaseException:
+        if UNIT.exists():
+            print(UNIT.read_text(), flush=True)
+            for diagnostic in (
+                [*PRIVILEGED, "systemctl", "status", "nestbot.service", "--no-pager"],
+                [*PRIVILEGED, "journalctl", "-u", "nestbot.service", "-n", "30", "--no-pager"],
+            ):
+                result = subprocess.run(diagnostic, capture_output=True, text=True, timeout=30)
+                print(result.stdout, result.stderr, flush=True)
+        raise
     finally:
         if UNIT.exists():
             subprocess.run([*PRIVILEGED, "systemctl", "disable", "--now", "nestbot.service"], capture_output=True, timeout=60)
