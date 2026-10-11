@@ -2,7 +2,7 @@ use crate::{
     application::App,
     domain::{ClaimRecord, Job, TransferMode},
     storage::Store,
-    telegram::{Account, RetryLater, bounded, parser, rpc, transfer},
+    telegram::{Account, RateLimited, bounded, parser, rpc, transfer},
 };
 use grammers_client::message::Message;
 use grammers_session::types::PeerRef;
@@ -14,24 +14,8 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 struct Collector {
-    task: tokio::task::JoinHandle<anyhow::Result<Collected>>,
+    task: tokio::task::JoinHandle<anyhow::Result<u32>>,
     stop: CancellationToken,
-}
-
-struct Collected {
-    count: u32,
-    limited: Option<u64>,
-}
-
-fn collected_error(count: u32, error: anyhow::Error) -> anyhow::Result<Collected> {
-    if let Some(limit) = error.downcast_ref::<RetryLater>() {
-        Ok(Collected {
-            count,
-            limited: Some(limit.seconds),
-        })
-    } else {
-        Err(error)
-    }
 }
 
 #[derive(Default)]
@@ -154,8 +138,8 @@ async fn collect(
     request_timeout: u64,
     cancel: CancellationToken,
     mut receiver: tokio::sync::broadcast::Receiver<grammers_client::message::Message>,
-) -> anyhow::Result<Collected> {
-    let clock = crate::telegram::ActiveClock::new();
+) -> anyhow::Result<u32> {
+    let clock = tokio::time::Instant::now();
     let mut deadline = Duration::from_secs(timeout);
     let mut initial_batch = true;
     let mut count = 0u32;
@@ -165,7 +149,6 @@ async fn collect(
     let mut clicked: HashMap<i32, String> = HashMap::new();
     let mut seen = HashMap::new();
     let mut saw_reply = false;
-    let mut limited = None;
     let mut latest_reply = after;
     let mut awaiting_group: Option<(i32, Duration)> = None;
     let mut poll = tokio::time::interval(Duration::from_secs(3));
@@ -197,7 +180,7 @@ async fn collect(
                     .await
                 {
                     Ok(scan) => scan,
-                    Err(error) => return collected_error(count, error),
+                    Err(error) => return Err(error),
                 };
                 last_id = scan.newest;
                 if scan.inserted > 0 {
@@ -234,11 +217,6 @@ async fn collect(
                     seen.remove(&id);
                 }
             }
-            if message.media().is_none()
-                && let Some(seconds) = parser::rate_wait(message.text())
-            {
-                limited = Some(seconds);
-            }
             if let Some((label, data)) =
                 parser::callback_button(&message, &["全部获取", "查看下一组", "下一组"])
             {
@@ -261,12 +239,6 @@ async fn collect(
                 saw_reply = true;
             }
         }
-        if let Some(seconds) = limited {
-            return Ok(Collected {
-                count,
-                limited: Some(seconds),
-            });
-        }
         if saw_reply && expected.is_some_and(|expected| count >= expected) {
             break;
         }
@@ -277,17 +249,9 @@ async fn collect(
             let refreshed =
                 match bounded(&cancel, request_timeout, account.refresh(peer, &ids)).await {
                     Ok(messages) => messages,
-                    Err(error) => return collected_error(count, error),
+                    Err(error) => return Err(error),
                 };
             for message in refreshed {
-                if message.media().is_none()
-                    && let Some(seconds) = parser::rate_wait(message.text())
-                {
-                    return Ok(Collected {
-                        count,
-                        limited: Some(seconds),
-                    });
-                }
                 if let Some((label, data)) =
                     parser::callback_button(&message, &["全部获取", "查看下一组", "下一组"])
                 {
@@ -326,18 +290,10 @@ async fn collect(
                 )
                 .await;
                 match result {
-                    Ok(Some(answer)) => {
-                        if let Some(seconds) = parser::rate_wait(&answer) {
-                            return Ok(Collected {
-                                count,
-                                limited: Some(seconds),
-                            });
-                        }
-                    }
-                    Ok(None) => {}
+                    Ok(_) => {}
                     Err(error) => {
-                        if cancel.is_cancelled() || error.downcast_ref::<RetryLater>().is_some() {
-                            return collected_error(count, error);
+                        if cancel.is_cancelled() || error.is::<RateLimited>() {
+                            return Err(error);
                         }
                         break;
                     }
@@ -356,10 +312,7 @@ async fn collect(
             break;
         }
     }
-    Ok(Collected {
-        count,
-        limited: None,
-    })
+    Ok(count)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -376,7 +329,7 @@ async fn once(
     dry: bool,
     batch: Option<(&str, u32)>,
     cancel: &CancellationToken,
-) -> anyhow::Result<(ClaimStats, Option<u64>)> {
+) -> anyhow::Result<ClaimStats> {
     let sender = &account;
     let timeout = app.config.limits.request_timeout_secs;
     let peer = bounded(
@@ -417,7 +370,7 @@ async fn once(
     .await?;
     let stop = cancel.child_token();
     let mut collector = Collector {
-        task: tokio::spawn(crate::telegram::inherit_flood_context(collect(
+        task: tokio::spawn(collect(
             account.clone(),
             app.store.clone(),
             job.summary.id.clone(),
@@ -429,7 +382,7 @@ async fn once(
             timeout,
             stop.clone(),
             receiver,
-        ))),
+        )),
         stop,
     };
     let mut count = 0;
@@ -497,7 +450,7 @@ async fn once(
         };
         if let Some(Err(error)) = &album
             && (cancel.is_cancelled()
-                || error.downcast_ref::<RetryLater>().is_some()
+                || error.is::<RateLimited>()
                 || app.store.has_uncertain(&job.summary.id).await?)
         {
             return Err(album.unwrap().unwrap_err());
@@ -555,7 +508,7 @@ async fn once(
                     }
                     Err(error) => {
                         if cancel.is_cancelled()
-                            || error.downcast_ref::<RetryLater>().is_some()
+                            || error.is::<RateLimited>()
                             || app.store.has_uncertain(&job.summary.id).await?
                         {
                             return Err(error);
@@ -584,10 +537,9 @@ async fn once(
             .await?;
         }
     }
-    stats.incomplete = collected.limited.is_some()
-        || collected.count == 0
+    stats.incomplete = collected == 0
         || expected.is_some_and(|n| record.files < n)
-        || count != collected.count
+        || count != collected
         || stats.failed > 0;
     if !dry && (stats.files > 0 || stats.resumed > 0) {
         record.failed = stats.failed;
@@ -596,7 +548,7 @@ async fn once(
             .save_claim_for_batch(payload, record, batch)
             .await?;
     }
-    Ok((stats, collected.limited))
+    Ok(stats)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -623,86 +575,60 @@ pub async fn run(
     } else {
         app.store.claim_record(payload).await?
     };
-    loop {
-        let result = async {
-            let account = app.users.account(cancel).await?;
-            once(
-                app,
-                job,
-                account,
-                &mut record,
-                payload,
-                expected,
-                mode,
-                target,
-                redo,
-                dry,
-                batch,
-                cancel,
-            )
-            .await
-        }
-        .await;
-        match result {
-            Err(error) if error.downcast_ref::<RetryLater>().is_some() => {
-                let seconds = error.downcast_ref::<RetryLater>().unwrap().seconds;
-                app.progress(&job.summary.id, "claim_waiting", 0, expected.map(u64::from))
-                    .await?;
-                crate::telegram::wait_flood(cancel, seconds).await?;
-            }
-            Ok((stats, Some(seconds))) => {
-                let mut report = app.store.report(&job.summary.id).await?;
-                report.skipped_files += stats.skipped;
-                report.failed_files += stats.failed;
-                app.store.save_report(&job.summary.id, &report).await?;
-                app.progress(&job.summary.id, "claim_waiting", 0, expected.map(u64::from))
-                    .await?;
-                crate::telegram::wait_flood(cancel, seconds).await?;
-                if stats.failed > 0 {
-                    let mut report = app.store.report(&job.summary.id).await?;
-                    report.failed_keys += 1;
-                    if !report.warnings.iter().any(|s| s == "claim_incomplete") {
-                        report.warnings.push("claim_incomplete".into());
-                    }
-                    app.store.save_report(&job.summary.id, &report).await?;
-                    return Ok(false);
+    let result = async {
+        let account = app.users.account(cancel).await?;
+        once(
+            app,
+            job,
+            account,
+            &mut record,
+            payload,
+            expected,
+            mode,
+            target,
+            redo,
+            dry,
+            batch,
+            cancel,
+        )
+        .await
+    }
+    .await;
+    let mut report = app.store.report(&job.summary.id).await?;
+    let completed = match result {
+        Ok(stats) => {
+            report.skipped_files += stats.skipped;
+            report.failed_files += stats.failed;
+            if stats.incomplete {
+                report.failed_keys += 1;
+                if !report
+                    .warnings
+                    .iter()
+                    .any(|warning| warning == "claim_incomplete")
+                {
+                    report.warnings.push("claim_incomplete".into());
                 }
             }
-            result => {
-                let mut report = app.store.report(&job.summary.id).await?;
-                let completed = match result {
-                    Ok((stats, None)) => {
-                        report.skipped_files += stats.skipped;
-                        report.failed_files += stats.failed;
-                        if stats.incomplete {
-                            report.failed_keys += 1;
-                            if !report.warnings.iter().any(|s| s == "claim_incomplete") {
-                                report.warnings.push("claim_incomplete".into());
-                            }
-                        }
-                        !stats.incomplete
-                    }
-                    Ok((_, Some(_))) => unreachable!("limited attempts handled above"),
-                    Err(error) => {
-                        if cancel.is_cancelled()
-                            || app.store.has_uncertain(&job.summary.id).await?
-                            || error.chain().any(|e| e.is::<rusqlite::Error>())
-                        {
-                            return Err(error);
-                        }
-                        report.failed_keys += 1;
-                        let code = crate::telemetry::safe_error(&error).to_string();
-                        if !report.warnings.contains(&code) {
-                            report.warnings.push(code);
-                        }
-                        false
-                    }
-                };
-                app.store.save_report(&job.summary.id, &report).await?;
-                return Ok(completed);
-            }
+            !stats.incomplete
         }
-    }
+        Err(error) => {
+            if cancel.is_cancelled()
+                || error.is::<RateLimited>()
+                || app.store.has_uncertain(&job.summary.id).await?
+                || error.chain().any(|cause| cause.is::<rusqlite::Error>())
+            {
+                return Err(error);
+            }
+            report.failed_keys += 1;
+            let code = crate::telemetry::safe_error(&error).to_string();
+            if !report.warnings.contains(&code) {
+                report.warnings.push(code);
+            }
+            false
+        }
+    };
+    app.store.save_report(&job.summary.id, &report).await?;
+    Ok(completed)
 }
 
 #[cfg(test)]

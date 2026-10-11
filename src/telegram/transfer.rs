@@ -179,7 +179,7 @@ async fn upload(
         .upload_stream(&mut stream, size as usize, name);
     tokio::pin!(future);
     let mut last_bytes = 0;
-    let clock = super::ActiveClock::new();
+    let clock = tokio::time::Instant::now();
     let mut last_progress = Duration::ZERO;
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     let uploaded = loop {
@@ -320,7 +320,7 @@ pub async fn one(
             Ok(sent)=>sent,
             Err(e)=>{
                 // A flood-wait rejection is definitive: no target message was sent.
-                if e.downcast_ref::<super::RetryLater>().is_some() || e.downcast_ref::<super::TelegramRejected>().is_some() {
+                if e.is::<super::RateLimited>() || e.is::<super::TelegramRejected>() {
                     let (scope,id)=(scope.to_owned(),id.clone());
                     app.store.call(move|c|{c.execute("DELETE FROM transfers WHERE scope=?1 AND media_id=?2 AND status='sending'",rusqlite::params![scope,id])?;Ok(())}).await?;
                 }
@@ -378,7 +378,7 @@ pub async fn album(
     let sent = match result {
         Ok(sent) => sent,
         Err(error) => {
-            if error.downcast_ref::<super::RetryLater>().is_some()
+            if error.is::<super::RateLimited>()
                 || error.downcast_ref::<super::TelegramRejected>().is_some()
             {
                 let (scope, ids) = (scope.to_owned(), ids.clone());
@@ -448,36 +448,25 @@ pub async fn incoming(
             .transfer_intent(&scope, &media, &job.summary.id, false)
             .await?;
         let copied = bounded(cancel, app.config.limits.request_timeout_secs, async {
-            loop {
-                match bot
-                    .copy_messages(
-                        destination.clone(),
-                        ChatId(source_chat),
-                        ids.iter().copied().map(MessageId),
-                    )
-                    .await
-                {
-                    Ok(copied) => break Ok(copied),
-                    Err(teloxide::RequestError::RetryAfter(seconds)) => {
-                        super::wait_flood(cancel, seconds.seconds() as u64).await?;
-                    }
-                    Err(error) => {
-                        break Err(match error {
-                            teloxide::RequestError::Api(_)
-                            | teloxide::RequestError::MigrateToChatId(_) => {
-                                anyhow::Error::new(super::TelegramRejected)
-                            }
-                            _ => anyhow::anyhow!("bot_copy_failed"),
-                        });
-                    }
+            bot.copy_messages(
+                destination.clone(),
+                ChatId(source_chat),
+                ids.iter().copied().map(MessageId),
+            )
+            .await
+            .map_err(|error| match error {
+                teloxide::RequestError::RetryAfter(_) => anyhow::Error::new(super::RateLimited),
+                teloxide::RequestError::Api(_) | teloxide::RequestError::MigrateToChatId(_) => {
+                    anyhow::Error::new(super::TelegramRejected)
                 }
-            }
+                _ => anyhow::anyhow!("bot_copy_failed"),
+            })
         })
         .await;
         let copied = match copied {
             Ok(copied) => copied,
             Err(error) => {
-                if error.downcast_ref::<super::TelegramRejected>().is_some() {
+                if error.is::<super::RateLimited>() || error.is::<super::TelegramRejected>() {
                     let (scope, media) = (scope.clone(), media.clone());
                     app.store.call(move |c| {c.execute("DELETE FROM transfers WHERE scope=?1 AND media_id=?2 AND status='sending'",rusqlite::params![scope,media])?;Ok(())}).await?;
                 }
@@ -581,7 +570,7 @@ pub async fn incoming(
                 Ok(None) => report.failed_files += 1,
                 Err(error) => {
                     if cancel.is_cancelled()
-                        || error.downcast_ref::<super::RetryLater>().is_some()
+                        || error.is::<super::RateLimited>()
                         || app.store.has_uncertain(&job.summary.id).await?
                     {
                         return Err(error);

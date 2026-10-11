@@ -1,6 +1,5 @@
 pub mod claim;
 pub mod migration;
-mod progress;
 pub mod search;
 
 use crate::{config::Config, domain::*, storage::Store, telegram::Users};
@@ -119,9 +118,11 @@ impl App {
     }
 
     pub async fn execute(&self, job: &Job, cancel: &CancellationToken) -> anyhow::Result<()> {
-        // Keep the large transfer future off the caller's stack while the
-        // progress observer holds it across long waits (including on Windows).
-        progress::observe(self, job, cancel, Box::pin(self.execute_inner(job, cancel))).await
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => anyhow::bail!("cancelled"),
+            result = Box::pin(self.execute_inner(job, cancel)) => result,
+        }
     }
 
     async fn execute_inner(&self, job: &Job, cancel: &CancellationToken) -> anyhow::Result<()> {
@@ -315,7 +316,6 @@ impl App {
         let mut report = self.store.report(&job.summary.id).await?;
         report.transfer_key = Some(sequence);
         self.store.save_report(&job.summary.id, &report).await?;
-        self.progress(&job.summary.id, "claim_waiting", 0, None)
-            .await
+        self.progress(&job.summary.id, "claim", 0, None).await
     }
 }

@@ -1,21 +1,21 @@
 use super::*;
 use crate::domain::JobPayload;
-use std::sync::Mutex;
+use tokio::sync::Mutex;
 
 #[tokio::test]
-async fn bot_api_copy_retries_only_the_rejected_request_after_wait_plus_60_seconds() {
+async fn api_rate_limit_stops_without_retry_and_preserves_previous_completed_transfers() {
     use axum::{Json, Router};
     let requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
     let captured = requests.clone();
-    let router=Router::new().fallback(move |Json(body):Json<serde_json::Value>| {
-        let captured=captured.clone();
+    let router = Router::new().fallback(move |Json(body): Json<serde_json::Value>| {
+        let captured = captured.clone();
         async move {
-            let mut requests=captured.lock().unwrap();
+            let mut requests = captured.lock().await;
             requests.push(body);
-            if requests.len()==1 {
-                Json(serde_json::json!({"ok":false,"error_code":429,"description":"Too Many Requests: retry after 7","parameters":{"retry_after":7}}))
-            } else {
+            if requests.len() == 1 {
                 Json(serde_json::json!({"ok":true,"result":[{"message_id":101}]}))
+            } else {
+                Json(serde_json::json!({"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":8}}))
             }
         }
     });
@@ -29,55 +29,57 @@ async fn bot_api_copy_retries_only_the_rejected_request_after_wait_plus_60_secon
         teloxide::Bot::new("000000:synthetic")
             .set_api_url(format!("http://{address}").parse().unwrap()),
     );
-    app.enqueue(
-        JobPayload::Incoming {
-            source_chat: 42,
-            message_ids: vec![11],
-            mode: TransferMode::Copy,
-            target: "-100123456789".into(),
-            caption: None,
-            caption_message: None,
-        },
-        Some(42),
-        None,
-    )
-    .await
-    .unwrap();
-    let job = app.store.next_job_lane(true).await.unwrap().unwrap();
-    let id = job.summary.id.clone();
-    let running = app.clone();
-    let task = tokio::spawn(async move { running.execute(&job, &CancellationToken::new()).await });
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if crate::interfaces::progress::waiting(&app, &id)
-                .await
-                .unwrap()
-                .is_some()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+    let mut completed_scope = None;
+    for (message, succeeds) in [(11, true), (12, false)] {
+        app.enqueue(
+            JobPayload::Incoming {
+                source_chat: 42,
+                message_ids: vec![message],
+                mode: TransferMode::Copy,
+                target: "-100123456789".into(),
+                caption: None,
+                caption_message: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let job = app.store.next_job_lane(true).await.unwrap().unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.execute(&job, &CancellationToken::new()),
+        )
+        .await
+        .unwrap();
+        if succeeds {
+            result.unwrap();
+            completed_scope = Some(
+                app.store
+                    .vault
+                    .index("incoming_scope", "42|-100123456789|copy"),
+            );
+        } else {
+            assert!(result.unwrap_err().is::<crate::telegram::RateLimited>());
+            assert!(!app.store.has_uncertain(&job.summary.id).await.unwrap());
         }
-    })
-    .await
-    .unwrap();
-    assert_eq!(requests.lock().unwrap().len(), 1);
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(66)).await;
-    tokio::task::yield_now().await;
-    assert_eq!(requests.lock().unwrap().len(), 1);
-    tokio::time::advance(Duration::from_secs(2)).await;
-    tokio::time::resume();
-    task.await.unwrap().unwrap();
-    let copied = requests.lock().unwrap().clone();
-    assert_eq!(copied.len(), 2);
-    assert_eq!(copied[0], copied[1]);
-    assert!(!app.store.has_uncertain(&id).await.unwrap());
-    assert!(
-        crate::interfaces::progress::waiting(&app, &id)
+    }
+    assert_eq!(requests.lock().await.len(), 2);
+    assert_eq!(
+        app.store
+            .transfer_status(&completed_scope.unwrap(), "11")
             .await
-            .unwrap()
-            .is_none()
+            .unwrap(),
+        Some(("done".into(), Some(101)))
     );
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(120)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        requests.lock().await.len(),
+        2,
+        "rate-limited request was automatically retried"
+    );
+    tokio::time::resume();
     server.abort();
 }

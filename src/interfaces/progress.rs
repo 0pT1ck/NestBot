@@ -1,6 +1,6 @@
 use crate::{
     application::App,
-    domain::{JobReport, JobSummary, JobWait, unix_time},
+    domain::{JobReport, JobSummary},
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -39,8 +39,7 @@ pub(crate) async fn receipt(app: &App, chat: i64, header: &str, id: &str) -> any
         return Ok(());
     };
     let report = app.store.report(id).await?;
-    let wait = waiting(app, id).await?;
-    let text = render(header, &job, &report, wait, unix_time());
+    let text = render(header, &job, &report);
     let message = tokio::select! {
         _ = app.shutdown.cancelled() => return Ok(()),
         result = tokio::time::timeout(Duration::from_secs(10), bot.send_message(ChatId(chat), text)) => result??,
@@ -56,15 +55,6 @@ pub(crate) async fn receipt(app: &App, chat: i64, header: &str, id: &str) -> any
     Ok(())
 }
 
-pub(crate) async fn waiting(app: &App, id: &str) -> anyhow::Result<Option<JobWait>> {
-    app.store
-        .preference(&format!("wait:{id}"))
-        .await?
-        .filter(|value| !value.is_empty())
-        .map(|value| serde_json::from_str(&value).map_err(Into::into))
-        .transpose()
-}
-
 fn active(job: &JobSummary) -> bool {
     matches!(
         job.status.as_str(),
@@ -72,13 +62,7 @@ fn active(job: &JobSummary) -> bool {
     )
 }
 
-pub(crate) fn render(
-    header: &str,
-    job: &JobSummary,
-    report: &JobReport,
-    wait: Option<JobWait>,
-    now: i64,
-) -> String {
+pub(crate) fn render(header: &str, job: &JobSummary, report: &JobReport) -> String {
     let state = match job.status.as_str() {
         "queued" | "waiting" => "排队中",
         "running" => "进行中",
@@ -118,22 +102,6 @@ pub(crate) fn render(
     } else if job.kind == "transfer" {
         lines.push("当前转存：等待开始处理密钥".into());
     }
-    if let Some(wait) = wait.filter(|_| job.status == "running") {
-        lines.push(format!(
-            "Telegram 要求等待 {} 秒，额外等待 60 秒；剩余 {} 秒，之后自动继续。",
-            wait.seconds,
-            wait.retry_at.saturating_sub(now).max(0)
-        ));
-    } else if report.search_retry > 0 && job.status == "running" {
-        lines.push(format!(
-            "翻页重试：第 {}/20 轮；{}",
-            report.search_retry,
-            report
-                .search_retry_at
-                .map(|at| format!("{} 秒后重试", at.saturating_sub(now).max(0)))
-                .unwrap_or_else(|| "正在重试原消息按钮".into())
-        ));
-    }
     if let Some(error) = &job.error_code {
         lines.push(format!("提示：{error}"));
     }
@@ -159,13 +127,7 @@ async fn update(
         return Ok(());
     };
     let report = app.store.report(id).await?;
-    let text = render(
-        &record.header,
-        &job,
-        &report,
-        waiting(app, id).await?,
-        unix_time(),
-    );
+    let text = render(&record.header, &job, &report);
     let now = tokio::time::Instant::now();
     if deliveries
         .get(id)
@@ -182,8 +144,17 @@ async fn update(
         Ok(Err(teloxide::RequestError::Api(teloxide::ApiError::MessageNotModified))) => {
             (true, Duration::from_secs(2))
         }
-        Ok(Err(teloxide::RequestError::RetryAfter(seconds))) => {
-            (false, seconds.duration() + Duration::from_secs(60))
+        Ok(Err(teloxide::RequestError::RetryAfter(_))) => {
+            // This edit was rejected. Retire its receipt instead of retrying it.
+            let name = format!("job-ui:{id}");
+            app.store
+                .call(move |connection| {
+                    connection.execute("DELETE FROM preferences WHERE name=?1", [name])?;
+                    Ok(())
+                })
+                .await?;
+            deliveries.remove(id);
+            return Ok(());
         }
         _ => (false, Duration::from_secs(10)),
     };

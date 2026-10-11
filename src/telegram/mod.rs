@@ -15,147 +15,22 @@ use grammers_session::{
     types::{PeerId, PeerRef, UpdateState, UpdatesState},
 };
 use std::{ops::ControlFlow, sync::Arc, time::Duration};
-use tokio::sync::{Mutex, broadcast, watch};
+use tokio::sync::{Mutex, broadcast};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
-pub struct RetryLater {
-    pub seconds: u64,
-}
-impl std::fmt::Display for RetryLater {
+pub struct RateLimited;
+impl std::fmt::Display for RateLimited {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("telegram_rate_limited")
     }
 }
-impl std::error::Error for RetryLater {}
+impl std::error::Error for RateLimited {}
 
-tokio::task_local! {
-    // Nested transfer and RPC deadlines must both exclude server-requested waits.
-    static FLOOD_BUDGETS: Vec<watch::Sender<Duration>>;
-    static FLOOD_EVENTS: watch::Sender<Option<FloodNotice>>;
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct FloodNotice {
-    pub wait: crate::domain::JobWait,
-    pub until: tokio::time::Instant,
-}
-
-pub(crate) fn flood_delay(seconds: u64) -> Duration {
-    let delay = Duration::from_secs(seconds.saturating_add(60));
-    let _ = FLOOD_BUDGETS.try_with(|budgets| {
-        for budget in budgets {
-            budget.send_modify(|total| *total += delay);
-        }
-    });
-    let _ = FLOOD_EVENTS.try_with(|events| {
-        let notice = FloodNotice {
-            wait: crate::domain::JobWait {
-                seconds,
-                retry_at: crate::domain::unix_time().saturating_add(delay.as_secs() as i64),
-            },
-            until: tokio::time::Instant::now() + delay,
-        };
-        events.send_if_modified(|current| {
-            if current.is_none_or(|old| old.until <= notice.until) {
-                *current = Some(notice);
-                true
-            } else {
-                false
-            }
-        });
-    });
-    delay
-}
-
-pub(crate) async fn wait_flood(cancel: &CancellationToken, seconds: u64) -> anyhow::Result<()> {
-    let delay = flood_delay(seconds);
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => anyhow::bail!("cancelled"),
-        _ = tokio::time::sleep(delay) => Ok(()),
-    }
-}
-
-pub(crate) async fn flood_scope<T>(
-    events: watch::Sender<Option<FloodNotice>>,
-    future: impl std::future::Future<Output = T>,
-) -> T {
-    FLOOD_EVENTS.scope(events, future).await
-}
-
-// Tokio tasks do not inherit task locals. The media collector must report
-// server-requested waits and extend enclosing deadlines.
-pub(crate) fn inherit_flood_context<T>(
-    future: impl std::future::Future<Output = T>,
-) -> impl std::future::Future<Output = T> {
-    let budgets = FLOOD_BUDGETS.try_with(Clone::clone).unwrap_or_default();
-    let events = FLOOD_EVENTS.try_with(Clone::clone).ok();
-    async move {
-        FLOOD_BUDGETS
-            .scope(budgets, async move {
-                if let Some(events) = events {
-                    flood_scope(events, future).await
-                } else {
-                    future.await
-                }
-            })
-            .await
-    }
-}
-
-pub(crate) fn flood_waited() -> Duration {
-    FLOOD_BUDGETS
-        .try_with(|budgets| {
-            budgets
-                .last()
-                .map(|budget| *budget.borrow())
-                .unwrap_or_default()
-        })
-        .unwrap_or_default()
-}
-
-pub(crate) struct ActiveClock {
-    start: tokio::time::Instant,
-    flood_origin: Duration,
-}
-
-impl ActiveClock {
-    pub(crate) fn new() -> Self {
-        Self {
-            start: tokio::time::Instant::now(),
-            flood_origin: flood_waited(),
-        }
-    }
-
-    pub(crate) fn elapsed(&self) -> Duration {
-        self.start
-            .elapsed()
-            .saturating_sub(flood_waited().saturating_sub(self.flood_origin))
-    }
-}
-
-struct TelegramFloodSleep;
-impl RetryPolicy for TelegramFloodSleep {
-    fn should_retry(&self, ctx: &RetryContext) -> ControlFlow<(), Duration> {
-        let InvocationError::Rpc(error) = &ctx.error else {
-            return ControlFlow::Break(());
-        };
-        // Telegram definitively rejected this RPC. Grammers retries its original
-        // serialized request, preserving random IDs; ambiguous failures never retry.
-        if error.code != 420 {
-            return ControlFlow::Break(());
-        }
-        let Some(seconds) = error.value.map(u64::from) else {
-            return ControlFlow::Break(());
-        };
-        let delay = flood_delay(seconds);
-        tracing::warn!(
-            event = "telegram_flood_wait",
-            seconds,
-            attempt = ctx.fail_count.get()
-        );
-        ControlFlow::Continue(delay)
+struct NoRpcRetry;
+impl RetryPolicy for NoRpcRetry {
+    fn should_retry(&self, _: &RetryContext) -> ControlFlow<(), Duration> {
+        ControlFlow::Break(())
     }
 }
 
@@ -170,13 +45,7 @@ impl std::error::Error for TelegramRejected {}
 
 pub fn rpc(error: InvocationError) -> anyhow::Error {
     match &error {
-        InvocationError::Rpc(e) if e.code == 420 => match e.value {
-            Some(seconds) => RetryLater {
-                seconds: u64::from(seconds),
-            }
-            .into(),
-            None => TelegramRejected.into(),
-        },
+        InvocationError::Rpc(e) if e.code == 420 => RateLimited.into(),
         InvocationError::Rpc(e) if (400..500).contains(&e.code) => TelegramRejected.into(),
         _ => anyhow::anyhow!("telegram_failed"),
     }
@@ -185,27 +54,15 @@ pub fn rpc(error: InvocationError) -> anyhow::Error {
 pub async fn bounded<T>(
     cancel: &CancellationToken,
     seconds: u64,
-    future: impl std::future::Future<Output = anyhow::Result<T>>,
+    future: impl Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
-    let (budget, mut waits) = watch::channel(Duration::ZERO);
-    let mut budgets = FLOOD_BUDGETS.try_with(Clone::clone).unwrap_or_default();
-    budgets.push(budget);
-    let start = tokio::time::Instant::now();
-    FLOOD_BUDGETS
-        .scope(budgets, async {
-            tokio::pin!(future);
-            loop {
-                let deadline = start + Duration::from_secs(seconds) + *waits.borrow_and_update();
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => anyhow::bail!("cancelled"),
-                    _ = waits.changed() => {},
-                    result = &mut future => return result,
-                    _ = tokio::time::sleep_until(deadline) => anyhow::bail!("telegram_timeout"),
-                }
-            }
-        })
-        .await
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => anyhow::bail!("cancelled"),
+        result = tokio::time::timeout(Duration::from_secs(seconds), future) => {
+            result.map_err(|_| anyhow::anyhow!("telegram_timeout"))?
+        }
+    }
 }
 
 pub struct Account {
@@ -262,7 +119,7 @@ impl Account {
         let client = Client::with_configuration(
             handle,
             ClientConfiguration {
-                retry_policy: Box::new(TelegramFloodSleep),
+                retry_policy: Box::new(NoRpcRetry),
                 auto_cache_peers: true,
             },
         );
@@ -459,185 +316,5 @@ impl Users {
         .await?;
         *slot = Some(account.clone());
         Ok(account)
-    }
-}
-
-#[cfg(test)]
-mod flood_tests {
-    use super::*;
-    use std::num::NonZeroU32;
-
-    fn context(seconds: u32, attempt: u32) -> RetryContext {
-        RetryContext {
-            fail_count: NonZeroU32::new(attempt).unwrap(),
-            slept_so_far: Duration::ZERO,
-            error: InvocationError::Rpc(grammers_mtsender::RpcError {
-                code: 420,
-                name: "FLOOD_WAIT".into(),
-                value: Some(seconds),
-                caused_by: None,
-            }),
-        }
-    }
-
-    #[test]
-    fn all_definitive_floods_wait_an_extra_minute_without_replaying_network_errors() {
-        for attempt in 1..=20 {
-            assert_eq!(
-                TelegramFloodSleep.should_retry(&context(60, attempt)),
-                ControlFlow::Continue(Duration::from_secs(120))
-            );
-        }
-        assert_eq!(
-            TelegramFloodSleep.should_retry(&context(763, 6)),
-            ControlFlow::Continue(Duration::from_secs(823))
-        );
-        let mut ctx = context(1, 1);
-        ctx.error = InvocationError::Dropped;
-        assert!(TelegramFloodSleep.should_retry(&ctx).is_break());
-        ctx.error = InvocationError::Rpc(grammers_mtsender::RpcError {
-            code: 400,
-            name: "BAD_REQUEST".into(),
-            value: None,
-            caused_by: None,
-        });
-        assert!(TelegramFloodSleep.should_retry(&ctx).is_break());
-    }
-
-    async fn simulate_request() -> anyhow::Result<u32> {
-        let mut accepted = 59;
-        for attempt in 1..=2 {
-            let ControlFlow::Continue(delay) =
-                TelegramFloodSleep.should_retry(&context(60, attempt))
-            else {
-                panic!("definitive rejection must wait");
-            };
-            tokio::time::sleep(delay).await;
-        }
-        // Retry the rejected RPC only; the prior 59 successes are untouched.
-        accepted += 1;
-        Ok(accepted)
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn short_waits_do_not_consume_nested_request_or_transfer_deadlines() {
-        let cancel = CancellationToken::new();
-        assert_eq!(
-            bounded(&cancel, 10, async {
-                bounded(&cancel, 2, simulate_request()).await
-            })
-            .await
-            .unwrap(),
-            60
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn cancellation_interrupts_flood_sleep_immediately() {
-        let cancel = CancellationToken::new();
-        let trigger = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            trigger.cancel();
-        });
-        let start = tokio::time::Instant::now();
-        let error = bounded(&cancel, 2, simulate_request()).await.unwrap_err();
-        assert_eq!(error.to_string(), "cancelled");
-        assert_eq!(start.elapsed(), Duration::from_secs(1));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn stalled_request_still_times_out_after_flood_wait() {
-        let cancel = CancellationToken::new();
-        let start = tokio::time::Instant::now();
-        let result: anyhow::Result<()> = bounded(&cancel, 2, async {
-            let _ = TelegramFloodSleep.should_retry(&context(60, 1));
-            tokio::time::sleep(Duration::from_secs(120)).await;
-            std::future::pending().await
-        })
-        .await;
-        assert_eq!(result.unwrap_err().to_string(), "telegram_timeout");
-        assert_eq!(start.elapsed(), Duration::from_secs(122));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn collector_rpc_waits_exactly_the_returned_time_plus_60_without_timing_out() {
-        let (events, notices) = watch::channel(None);
-        let cancel = CancellationToken::new();
-        let start = tokio::time::Instant::now();
-        flood_scope(
-            events,
-            bounded(&cancel, 2, async {
-                tokio::spawn(inherit_flood_context(async {
-                    let ControlFlow::Continue(delay) =
-                        TelegramFloodSleep.should_retry(&context(7200, 1))
-                    else {
-                        panic!("rate-limited collector must retry the same RPC");
-                    };
-                    tokio::time::sleep(delay).await;
-                }))
-                .await?;
-                assert_eq!(flood_waited(), Duration::from_secs(7260));
-                Ok(())
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(start.elapsed(), Duration::from_secs(7260));
-        let notice = notices.borrow().unwrap();
-        assert_eq!(notice.wait.seconds, 7200);
-        assert_eq!(notice.until, start + Duration::from_secs(7260));
-    }
-
-    #[test]
-    fn zero_seconds_is_not_rounded_up_and_long_waits_are_not_capped() {
-        for seconds in [0, 1, 7200, 86400] {
-            assert_eq!(
-                TelegramFloodSleep.should_retry(&context(seconds, 1)),
-                ControlFlow::Continue(Duration::from_secs(u64::from(seconds) + 60))
-            );
-            assert_eq!(
-                rpc(context(seconds, 1).error)
-                    .downcast_ref::<RetryLater>()
-                    .unwrap()
-                    .seconds,
-                u64::from(seconds)
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod untimed_flood_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn missing_rpc_wait_time_returns_an_error_without_inventing_a_countdown() {
-        let error = || {
-            InvocationError::Rpc(grammers_mtsender::RpcError {
-                code: 420,
-                name: "FLOOD_WAIT".into(),
-                value: None,
-                caused_by: None,
-            })
-        };
-        let (events, notices) = watch::channel(None);
-        flood_scope(
-            events,
-            bounded(&CancellationToken::new(), 2, async {
-                let context = RetryContext {
-                    fail_count: std::num::NonZeroU32::new(1).unwrap(),
-                    slept_so_far: Duration::ZERO,
-                    error: error(),
-                };
-                assert!(TelegramFloodSleep.should_retry(&context).is_break());
-                assert_eq!(flood_waited(), Duration::ZERO);
-                assert!(notices.borrow().is_none());
-                assert!(rpc(error()).is::<TelegramRejected>());
-                Ok(())
-            }),
-        )
-        .await
-        .unwrap();
     }
 }

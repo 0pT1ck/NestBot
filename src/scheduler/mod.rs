@@ -1,4 +1,4 @@
-use crate::{application::App, telegram::RetryLater, telemetry};
+use crate::{application::App, telegram::RateLimited, telemetry};
 use std::{sync::Arc, time::Duration};
 
 pub async fn worker(app: Arc<App>, fast: bool) -> anyhow::Result<()> {
@@ -26,30 +26,23 @@ pub async fn worker(app: Arc<App>, fast: bool) -> anyhow::Result<()> {
             let uncertain = app.store.has_uncertain(&job.summary.id).await?;
             let report = app.store.report(&job.summary.id).await?;
             let partial_search = job.summary.kind == "search"
-                && report.warnings.iter().any(|warning| {
-                    matches!(
-                        warning.as_str(),
-                        "search_page_stalled" | "search_retries_exhausted"
-                    )
-                });
-            let rate_wait = result
-                .as_ref()
-                .err()
-                .and_then(|error| error.downcast_ref::<RetryLater>())
-                .map(|wait| wait.seconds);
-            let (status, error, retry) = match result {
-                Ok(()) if partial_search => ("partial", None, None),
-                Ok(()) => ("completed", None, None),
-                Err(_) if uncertain => ("review", Some("transfer_uncertain"), None),
-                Err(_) if app.shutdown.is_cancelled() => ("interrupted", None, None),
-                Err(_) if token.is_cancelled() => ("cancelled", None, None),
-                Err(ref e) if e.downcast_ref::<RetryLater>().is_some() => {
-                    ("failed", Some("telegram_rate_limited"), None)
+                && report
+                    .warnings
+                    .iter()
+                    .any(|warning| warning == "search_page_stalled");
+            let (status, error) = match &result {
+                Ok(()) if partial_search => ("partial", None),
+                Ok(()) => ("completed", None),
+                Err(_) if uncertain => ("review", Some("transfer_uncertain")),
+                Err(_) if app.shutdown.is_cancelled() => ("interrupted", None),
+                Err(_) if token.is_cancelled() => ("cancelled", None),
+                Err(error) if error.is::<RateLimited>() => {
+                    ("failed", Some("telegram_rate_limited"))
                 }
-                Err(ref e) => ("failed", Some(telemetry::safe_error(e)), None),
+                Err(error) => ("failed", Some(telemetry::safe_error(error))),
             };
             app.store
-                .finish(&job.summary.id, status, error, retry)
+                .finish(&job.summary.id, status, error, None)
                 .await?;
             app.active
                 .lock()
@@ -60,9 +53,6 @@ pub async fn worker(app: Arc<App>, fast: bool) -> anyhow::Result<()> {
             if let (Some(bot), Some(chat)) = (&app.bot, job.reply_chat) {
                 use teloxide::prelude::*;
                 let mut progress = String::new();
-                if let Some(seconds) = rate_wait {
-                    progress.push_str(&format!("\nTelegram 要求等待 {seconds} 秒；该请求未能进入自动等待，已完成部分保留。可在 {} 秒后重新执行原命令续传。", seconds.saturating_add(60)));
-                }
                 if report.pages > 0 {
                     progress.push_str(&format!("\n已保存 {} 页搜索结果。", report.pages));
                 }
@@ -79,13 +69,6 @@ pub async fn worker(app: Arc<App>, fast: bool) -> anyhow::Result<()> {
                     .any(|warning| warning == "search_page_stalled")
                 {
                     progress.push_str("\n翻页等待超时，已停止本次搜索，已保存结果保留。");
-                }
-                if report
-                    .warnings
-                    .iter()
-                    .any(|warning| warning == "search_retries_exhausted")
-                {
-                    progress.push_str("\n连续 20 轮翻页未恢复，已停止自动重试。");
                 }
                 if job.summary.kind == "transfer" {
                     progress.push_str(&format!("\n成功 {} 个文件，续传/重复跳过 {} 个文件，已完成跳过 {} 个密钥；失败 {} 个密钥、{} 个文件。",report.files,report.skipped_files,report.skipped_keys,report.failed_keys,report.failed_files));

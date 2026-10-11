@@ -51,6 +51,7 @@ pub fn safe_error(error: &anyhow::Error) -> &'static str {
         "source_media_missing" => "source_media_missing",
         "login_failed" => "login_failed",
         "telegram_failed" => "telegram_failed",
+        "telegram_rate_limited" => "telegram_rate_limited",
         "upload_failed" => "upload_failed",
         "invalid_preference" => "invalid_preference",
         "invalid_mode" => "invalid_mode",

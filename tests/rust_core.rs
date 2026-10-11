@@ -616,8 +616,6 @@ fn parser_handles_utf16_links_and_page_footer() {
     assert_eq!(page.page, Some(3));
     assert_eq!(page.entries[0].file_count, Some(12));
     assert_eq!(page.entries[0].payload(), "synthetic+key");
-    assert_eq!(parser::rate_wait("请稍后，等待 18 分钟"), Some(1080));
-    assert_eq!(parser::rate_wait("普通内容"), None);
 }
 
 #[tokio::test]
@@ -788,15 +786,6 @@ fn configuration_rejects_unbounded_or_exposed_defaults() {
 #[test]
 fn processing_notices_are_not_limits_and_empty_search_is_recognized() {
     use nestbot::telegram::parser;
-    for text in [
-        "请稍候",
-        "正在搜索，请稍候……",
-        "正在获取文件，请稍后",
-        "正在处理，预计等待 10 秒",
-    ] {
-        assert_eq!(parser::rate_wait(text), None, "{text}");
-    }
-    assert_eq!(parser::rate_wait("请等待 1048 秒后重试"), Some(1048));
     assert!(parser::no_search_results(
         "🔎 搜索词：synthetic\n🔍 未找到相关结果"
     ));

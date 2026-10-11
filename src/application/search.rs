@@ -1,7 +1,7 @@
 use crate::{
     application::App,
     domain::Job,
-    telegram::{Account, RetryLater, bounded, parser, rpc},
+    telegram::{Account, RateLimited, bounded, parser, rpc},
 };
 use grammers_client::message::Message;
 use grammers_session::types::PeerRef;
@@ -184,11 +184,6 @@ fn processing(text: &str) -> bool {
         .any(|s| text.contains(s))
 }
 
-fn retryable_search_error(text: &str) -> bool {
-    ["错误", "失败"].iter().any(|signal| text.contains(signal))
-        && ["重试", "再试"].iter().any(|signal| text.contains(signal))
-}
-
 fn settle(
     candidate: &mut Option<(Message, PageState, Instant)>,
     message: Message,
@@ -258,7 +253,6 @@ async fn wait_page_inner(
 ) -> anyhow::Result<Option<Message>> {
     let previous = mode.previous();
     let mut deadline = Instant::now() + Duration::from_secs(timeout);
-    let mut flood_origin = crate::telegram::flood_waited();
     let mut next_poll = Instant::now();
     let mut updates_open = true;
     let mut best: Option<Message> = None;
@@ -275,8 +269,7 @@ async fn wait_page_inner(
             let (message, state, _) = candidate.take().unwrap();
             return Ok((state == PageState::Ready).then_some(message));
         }
-        let flood_delay = crate::telegram::flood_waited().saturating_sub(flood_origin);
-        let remaining = (deadline + flood_delay).saturating_duration_since(Instant::now());
+        let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero()
             || (previous.is_none()
                 && best.is_some()
@@ -304,7 +297,7 @@ async fn wait_page_inner(
                         let first_reply = seen.is_empty();
                         if previous.is_some_and(|p| p.raw != message.raw) && parse(&message).entries.is_empty() { notice=Some(message.clone()); }
                         if observe(&mut seen, &mut best, &message) {
-                            if previous.is_none() && first_reply {deadline=Instant::now()+Duration::from_secs(timeout);flood_origin=crate::telegram::flood_waited();}
+                            if previous.is_none() && first_reply {deadline=Instant::now()+Duration::from_secs(timeout);}
                             last_new=Instant::now();
                         }
                         match page_ready(&message, mode)? {
@@ -326,7 +319,7 @@ async fn wait_page_inner(
                 // not discard a healthy update stream or the whole search.
                 let messages = match bounded(cancel,remaining.as_secs().clamp(1,10),account.poll(peer, after, previous.map(Message::id))).await {
                     Ok(messages) => messages,
-                    Err(error) if cancel.is_cancelled() || error.downcast_ref::<RetryLater>().is_some() => return Err(error),
+                    Err(error) if cancel.is_cancelled() || error.is::<RateLimited>() => return Err(error),
                     Err(error) => {
                         tracing::warn!(event="search_history_failed",error_code=crate::telemetry::safe_error(&error));
                         continue;
@@ -337,7 +330,7 @@ async fn wait_page_inner(
                     let first_reply = seen.is_empty();
                     if previous.is_some_and(|p| p.raw != message.raw) && parse(&message).entries.is_empty() { notice=Some(message.clone()); }
                     if observe(&mut seen, &mut best, &message) {
-                        if previous.is_none() && first_reply {deadline=Instant::now()+Duration::from_secs(timeout);flood_origin=crate::telegram::flood_waited();}
+                        if previous.is_none() && first_reply {deadline=Instant::now()+Duration::from_secs(timeout);}
                         last_new=Instant::now();
                     }
                     match page_ready(&message, mode)? {
@@ -403,8 +396,6 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let mut report = app.store.report(&job.summary.id).await?;
     report.pages = 0;
-    report.search_retry = 0;
-    report.search_retry_at = None;
     report.search_page = None;
     report.search_total_pages = None;
     report
@@ -565,103 +556,6 @@ struct Pagination<'a> {
     reused: bool,
 }
 
-const SEARCH_RETRY_LIMIT: u32 = 20;
-const SEARCH_RETRY_SECONDS: u64 = 60;
-
-enum RetryWake {
-    Retry,
-    Page(Box<Message>),
-    End,
-}
-
-async fn refresh_retry(
-    account: &impl PageHistory,
-    receiver: &mut PageInbox,
-    peer: PeerRef,
-    previous: &Message,
-    cancel: &CancellationToken,
-) -> anyhow::Result<Option<RetryWake>> {
-    let messages = match bounded(
-        cancel,
-        10,
-        account.poll(peer, previous.id(), Some(previous.id())),
-    )
-    .await
-    {
-        Ok(messages) => messages,
-        Err(error) if cancel.is_cancelled() || error.downcast_ref::<RetryLater>().is_some() => {
-            return Err(error);
-        }
-        Err(_) => return Ok(None),
-    };
-    let mut candidate = None;
-    for message in messages {
-        if !receiver.accept(&message, PageMode::Next(previous))? {
-            continue;
-        }
-        match page_ready(&message, PageMode::Next(previous))? {
-            PageState::End => return Ok(Some(RetryWake::End)),
-            PageState::Ready if !parse(&message).entries.is_empty() => {
-                settle(&mut candidate, message, PageState::Ready)
-            }
-            _ => {}
-        }
-    }
-    Ok(candidate.map(|(message, _, _)| RetryWake::Page(Box::new(message))))
-}
-
-async fn wait_retry(
-    account: &impl PageHistory,
-    receiver: &mut PageInbox,
-    peer: PeerRef,
-    previous: &Message,
-    cancel: &CancellationToken,
-) -> anyhow::Result<RetryWake> {
-    let deadline = Instant::now() + Duration::from_secs(SEARCH_RETRY_SECONDS);
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(RetryWake::Retry);
-        }
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => anyhow::bail!("cancelled"),
-            _ = tokio::time::sleep_until(deadline) => return Ok(RetryWake::Retry),
-            result = wait_page(account,receiver,peer,previous.id(),PageMode::Next(previous),remaining.as_secs().max(1),cancel) => {
-                match result {
-                    Ok(Some(message)) if !parse(&message).entries.is_empty() => return Ok(RetryWake::Page(Box::new(message))),
-                    Ok(None) => return Ok(RetryWake::End),
-                    Err(error) if cancel.is_cancelled() || error.downcast_ref::<RetryLater>().is_some() => return Err(error),
-                    _ => {},
-                }
-            }
-        }
-    }
-}
-
-async fn notify(
-    app: &App,
-    job: &Job,
-    text: &str,
-    cancel: &CancellationToken,
-) -> anyhow::Result<()> {
-    if let Some(chat) = job.reply_chat {
-        bounded(cancel, 10, async {
-            crate::interfaces::bot::send(app, chat, text).await;
-            Ok(())
-        })
-        .await
-        .or_else(|error| {
-            if cancel.is_cancelled() {
-                Err(error)
-            } else {
-                Ok(())
-            }
-        })?;
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn paginate(
     app: &App,
@@ -682,7 +576,6 @@ async fn paginate(
     } = options;
     let mut collected = 0u32;
     let mut first = reused;
-    let mut retries = 0;
     if reused {
         let page = parse(&reply);
         let mut report = app.store.report(&job.summary.id).await?;
@@ -716,22 +609,10 @@ async fn paginate(
                     .await?;
                 collected += 1;
                 let mut report = app.store.report(&job.summary.id).await?;
-                let recovered = report.search_retry > 0;
                 report.pages = collected;
                 report.search_page = Some(current);
                 report.search_total_pages = page.total_pages;
-                report.search_retry = 0;
-                report.search_retry_at = None;
                 app.store.save_report(&job.summary.id, &report).await?;
-                if recovered {
-                    notify(
-                        app,
-                        job,
-                        &format!("搜索已恢复：已保存第 {current} 页，继续翻页。"),
-                        cancel,
-                    )
-                    .await?;
-                }
                 app.progress(
                     &job.summary.id,
                     "search",
@@ -753,35 +634,10 @@ async fn paginate(
             Ok(())
         })
         .await?;
-        if retries > 0 {
-            match refresh_retry(account, receiver, peer, &reply, cancel).await? {
-                Some(RetryWake::Page(next)) => {
-                    reply = *next;
-                    retries = 0;
-                    first = false;
-                    continue;
-                }
-                Some(RetryWake::End) => break,
-                _ => {}
-            }
-        }
-        if retries > 0 {
-            let mut report = app.store.report(&job.summary.id).await?;
-            report.search_retry_at = None;
-            app.store.save_report(&job.summary.id, &report).await?;
-            app.progress(
-                &job.summary.id,
-                "search_retrying",
-                collected as u64,
-                pages.map(u64::from),
-            )
-            .await?;
-            notify(app,job,&format!("正在使用原消息的“下一页”按钮重试（第 {retries}/{SEARCH_RETRY_LIMIT} 轮，已保存 {collected} 页）。"),cancel).await?;
-        }
-        tracing::info!(event="search_next_click",job_id=%job.summary.id,message_id=reply.id(),page=parse(&reply).page,retry=retries);
+        tracing::info!(event="search_next_click",job_id=%job.summary.id,message_id=reply.id(),page=parse(&reply).page);
         let answer = match bounded(cancel, timeout, account.click(peer, &reply, data)).await {
             Ok(answer) => answer,
-            Err(error) if error.downcast_ref::<RetryLater>().is_some() => return Err(error),
+            Err(error) if error.is::<RateLimited>() => return Err(error),
             Err(error) if cancel.is_cancelled() => return Err(error),
             Err(error) => {
                 // A callback acknowledgement may fail while the bot still edits
@@ -793,78 +649,37 @@ async fn paginate(
         if answer.as_deref().is_some_and(parser::search_end) {
             break;
         }
-        if let Some(seconds) = answer.as_deref().and_then(parser::rate_wait) {
-            crate::telegram::wait_flood(cancel, seconds).await?;
-            first = true;
-            continue;
-        }
-        let next = if answer.as_deref().is_some_and(retryable_search_error) {
-            Some(reply.clone())
-        } else {
-            match wait_page(
-                account,
-                receiver,
-                peer,
-                reply.id(),
-                PageMode::Next(&reply),
-                timeout,
-                cancel,
-            )
-            .await
-            {
-                Ok(next) => next,
-                Err(error) if error.downcast_ref::<RetryLater>().is_some() => return Err(error),
-                Err(error) if cancel.is_cancelled() => return Err(error),
-                Err(error) => {
-                    tracing::warn!(event="search_page_wait_failed",job_id=%job.summary.id,error_code=crate::telemetry::safe_error(&error),page=parse(&reply).page);
-                    app.store
-                        .warning(&job.summary.id, "search_page_stalled")
-                        .await?;
-                    break;
-                }
+        let next = match wait_page(
+            account,
+            receiver,
+            peer,
+            reply.id(),
+            PageMode::Next(&reply),
+            timeout,
+            cancel,
+        )
+        .await
+        {
+            Ok(next) => next,
+            Err(error) if error.is::<RateLimited>() => return Err(error),
+            Err(error) if cancel.is_cancelled() => return Err(error),
+            Err(error) => {
+                tracing::warn!(event="search_page_wait_failed",job_id=%job.summary.id,error_code=crate::telemetry::safe_error(&error),page=parse(&reply).page);
+                app.store
+                    .warning(&job.summary.id, "search_page_stalled")
+                    .await?;
+                break;
             }
         };
         let Some(next) = next else {
             break;
         };
-        if let Some(seconds) = parser::rate_wait(next.text()) {
-            crate::telegram::wait_flood(cancel, seconds).await?;
-            first = true;
-            continue;
-        }
         if parse(&next).entries.is_empty() || next.raw == reply.raw {
-            retries += 1;
-            if retries > SEARCH_RETRY_LIMIT {
-                app.store
-                    .warning(&job.summary.id, "search_retries_exhausted")
-                    .await?;
-                break;
-            }
-            app.progress(
-                &job.summary.id,
-                "search_waiting",
-                collected as u64,
-                pages.map(u64::from),
-            )
-            .await?;
-            let mut report = app.store.report(&job.summary.id).await?;
-            report.search_retry = retries;
-            report.search_retry_at = Some(crate::domain::unix_time() + SEARCH_RETRY_SECONDS as i64);
-            app.store.save_report(&job.summary.id, &report).await?;
-            notify(app,job,&format!("搜索 Bot 暂时无法翻页，已保存 {collected} 页。{SEARCH_RETRY_SECONDS} 秒后自动重试原消息的“下一页”（第 {retries}/{SEARCH_RETRY_LIMIT} 轮）；可用 /status 查看，/stop 停止。"),cancel).await?;
-            first = true;
-            match wait_retry(account, receiver, peer, &reply, cancel).await? {
-                RetryWake::Page(next) => {
-                    reply = *next;
-                    retries = 0;
-                    first = false;
-                }
-                RetryWake::End => break,
-                RetryWake::Retry => {}
-            }
-            continue;
+            app.store
+                .warning(&job.summary.id, "search_page_stalled")
+                .await?;
+            break;
         }
-        retries = 0;
         reply = next;
     }
     Ok(())
