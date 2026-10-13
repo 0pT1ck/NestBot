@@ -57,6 +57,8 @@ pub enum Command {
     /// Check configuration without connecting to Telegram.
     Doctor,
     Status,
+    /// Restart Bot, Telegram connections and workers in the running service.
+    Restart,
     Jobs {
         #[arg(long, default_value_t = 50)]
         limit: u32,
@@ -364,6 +366,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         command => {
             let action = match command {
                 Command::Status => Action::Status,
+                Command::Restart => Action::Restart,
                 Command::Jobs { limit, offset } => Action::Jobs { limit, offset },
                 Command::Search {
                     keyword,

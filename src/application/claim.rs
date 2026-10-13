@@ -13,8 +13,14 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[derive(Debug)]
+struct Collected {
+    count: u32,
+    incomplete: bool,
+}
+
 struct Collector {
-    task: tokio::task::JoinHandle<anyhow::Result<u32>>,
+    task: tokio::task::JoinHandle<anyhow::Result<Collected>>,
     stop: CancellationToken,
 }
 
@@ -125,8 +131,61 @@ impl ClaimSource for Account {
     }
 }
 
+async fn pending_count(store: &Store, job: &str, claim: &str) -> anyhow::Result<u32> {
+    let (job, claim) = (job.to_owned(), claim.to_owned());
+    store
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM claim_inbox WHERE job_id=?1 AND claim=?2 AND processed=0",
+                rusqlite::params![job, claim],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn collect(
+    account: Arc<impl ClaimSource>,
+    store: Store,
+    job: String,
+    claim: String,
+    peer: PeerRef,
+    after: i32,
+    expected: Option<u32>,
+    timeout: u64,
+    request_timeout: u64,
+    cancel: CancellationToken,
+    receiver: tokio::sync::broadcast::Receiver<Message>,
+) -> anyhow::Result<Collected> {
+    let result = tokio::time::timeout(
+        Duration::from_secs(timeout),
+        collect_inner(
+            account,
+            store.clone(),
+            job.clone(),
+            claim.clone(),
+            peer,
+            after,
+            expected,
+            timeout,
+            request_timeout,
+            cancel,
+            receiver,
+        ),
+    )
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => Ok(Collected {
+            count: pending_count(&store, &job, &claim).await?,
+            incomplete: true,
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn collect_inner(
     account: Arc<impl ClaimSource>,
     store: Store,
     job: String,
@@ -138,10 +197,9 @@ async fn collect(
     request_timeout: u64,
     cancel: CancellationToken,
     mut receiver: tokio::sync::broadcast::Receiver<grammers_client::message::Message>,
-) -> anyhow::Result<u32> {
+) -> anyhow::Result<Collected> {
     let clock = tokio::time::Instant::now();
-    let mut deadline = Duration::from_secs(timeout);
-    let mut initial_batch = true;
+    let deadline = Duration::from_secs(timeout);
     let mut count = 0u32;
     let mut last = clock.elapsed();
     let mut last_id = after;
@@ -154,12 +212,14 @@ async fn collect(
     let mut poll = tokio::time::interval(Duration::from_secs(3));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut updates_open = true;
+    let mut navigation_incomplete = false;
     loop {
-        if clock.elapsed() >= deadline && (!saw_reply || !initial_batch) {
+        if clock.elapsed() >= deadline {
             break;
         }
         let event = tokio::select! {
             _=cancel.cancelled()=>anyhow::bail!("cancelled"),
+            _=tokio::time::sleep_until(clock + deadline)=>break,
             _=poll.tick()=>None,
             event=receiver.recv(), if updates_open=>Some(event),
         };
@@ -262,16 +322,13 @@ async fn collect(
             }
         }
         if awaiting_group.is_some_and(|(_, until)| clock.elapsed() >= until) {
+            navigation_incomplete = true;
             break;
         }
         if saw_reply
             && awaiting_group.is_none()
             && clock.elapsed().saturating_sub(last) >= Duration::from_secs(8)
         {
-            if initial_batch {
-                deadline = clock.elapsed() + Duration::from_secs(timeout);
-                initial_batch = false;
-            }
             if let Some((message, label, data)) = navigation
                 .values()
                 .rev()
@@ -295,6 +352,7 @@ async fn collect(
                         if cancel.is_cancelled() || error.is::<RateLimited>() {
                             return Err(error);
                         }
+                        navigation_incomplete = true;
                         break;
                     }
                 }
@@ -309,10 +367,17 @@ async fn collect(
                 ));
                 continue;
             }
-            break;
+            // A processing notice is not a completed claim. Wait for the first
+            // media, and for known counts to arrive, up to the total deadline.
+            if count > 0 && expected.is_none_or(|expected| count >= expected) {
+                break;
+            }
         }
     }
-    Ok(count)
+    Ok(Collected {
+        count,
+        incomplete: navigation_incomplete || clock.elapsed() >= deadline,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -358,36 +423,46 @@ async fn once(
         "transfer_scope",
         &serde_json::to_string(&(identity, target, mode.as_str(), payload))?,
     );
-    app.store.reset_inbox(&job.summary.id, &claim).await?;
-    let receiver = account.messages.subscribe();
-    let sent = bounded(cancel, timeout, async {
-        account
-            .client
-            .send_message(peer, format!("/start {payload}"))
-            .await
-            .map_err(rpc)
-    })
-    .await?;
-    let stop = cancel.child_token();
-    let mut collector = Collector {
-        task: tokio::spawn(collect(
-            account.clone(),
-            app.store.clone(),
-            job.summary.id.clone(),
-            claim.clone(),
-            peer,
-            sent.id(),
-            expected,
-            app.config.limits.claim_timeout_secs,
-            timeout,
-            stop.clone(),
-            receiver,
-        )),
-        stop,
+    // Drain media saved by an interrupted or rate-limited attempt before
+    // sending a new /start. A manual retry must not erase unprocessed replies.
+    let recovered = pending_count(&app.store, &job.summary.id, &claim).await?;
+    let collected = if recovered > 0 {
+        Collected {
+            count: recovered,
+            incomplete: expected.is_none(),
+        }
+    } else {
+        app.store.reset_inbox(&job.summary.id, &claim).await?;
+        let receiver = account.messages.subscribe();
+        let sent = bounded(cancel, timeout, async {
+            account
+                .client
+                .send_message(peer, format!("/start {payload}"))
+                .await
+                .map_err(rpc)
+        })
+        .await?;
+        let stop = cancel.child_token();
+        let mut collector = Collector {
+            task: tokio::spawn(collect(
+                account.clone(),
+                app.store.clone(),
+                job.summary.id.clone(),
+                claim.clone(),
+                peer,
+                sent.id(),
+                expected,
+                app.config.limits.claim_timeout_secs,
+                timeout,
+                stop.clone(),
+                receiver,
+            )),
+            stop,
+        };
+        (&mut collector.task).await??
     };
     let mut count = 0;
     let mut stats = ClaimStats::default();
-    let collected = (&mut collector.task).await??;
     loop {
         let ids = app.store.inbox_next(&job.summary.id, &claim).await?;
         if ids.is_empty() {
@@ -537,9 +612,10 @@ async fn once(
             .await?;
         }
     }
-    stats.incomplete = collected == 0
+    stats.incomplete = collected.incomplete
+        || collected.count == 0
         || expected.is_some_and(|n| record.files < n)
-        || count != collected
+        || count != collected.count
         || stats.failed > 0;
     if !dry && (stats.files > 0 || stats.resumed > 0) {
         record.failed = stats.failed;

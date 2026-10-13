@@ -16,6 +16,7 @@ pub struct App {
     pub users: Users,
     pub notify: Notify,
     pub shutdown: CancellationToken,
+    pub restart: CancellationToken,
     pub events: broadcast::Sender<ServiceEvent>,
     pub active: Mutex<HashMap<String, CancellationToken>>,
     pub bot: Option<teloxide::Bot>,
@@ -48,6 +49,7 @@ impl App {
             store,
             notify: Notify::new(),
             shutdown: CancellationToken::new(),
+            restart: CancellationToken::new(),
             events,
             active: Mutex::new(HashMap::new()),
             bot,
@@ -146,6 +148,9 @@ impl App {
             } => {
                 let mut report = self.store.report(&job.summary.id).await?;
                 report.transfer_key = None;
+                report.failed_keys = 0;
+                report.failed_files = 0;
+                report.warnings.clear();
                 self.store.save_report(&job.summary.id, &report).await?;
                 let mut options = options.clone();
                 let current_target = if job.reply_chat.is_some() {

@@ -123,6 +123,8 @@ systemctl status nestbot
 systemctl is-enabled nestbot
 ```
 
+Telegram 白名单用户可发送 `/restart` 重启 Bot、主账号 Telegram 连接、任务调度器、Web 和本地控制接口；CLI 也支持 `nestbot restart`。这是进程内重新初始化，通常在 15 秒内完成，不需要 sudo，也不重新登录。已完成记录与排队任务保留；被打断的任务恢复排队，发送结果不确定的任务进入 `review`，需核对后再重试。重启命令会先保存 Bot 更新位置，避免重启循环。该方式沿用已加载的配置；修改 TOML 或 secrets.env 后，使用上面的 `deploy/run-local.sh restart` 重启整个进程。若 Bot 已无法响应，也使用脚本重启。
+
 `stop` 和 Telegram `/stop` 只停止任务，不关闭服务。永久关闭开机自启使用 `sudo systemctl disable --now nestbot`；root 去掉 sudo。重新开启使用 `sudo systemctl enable nestbot`，然后通过入口 `start`。不要另外启动 `serve` 常驻实例，与 systemd 同时运行会争用同一份数据库。
 
 后台服务设置 CPUQuota=50%、MemoryHigh=384M、MemoryMax=512M，日志仍不会自动轮转；需定期归档。512MiB 是 cgroup 硬上限，不代表真实 Telegram 转存峰值已测定；超限可能被 OOM 终止并重启，需观察实际 VPS。

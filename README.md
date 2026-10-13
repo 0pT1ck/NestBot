@@ -25,6 +25,7 @@ Web 默认地址：http://127.0.0.1:8787。管理密码至少 12 字符；密钥
 
 ```powershell
 .\target\release\nestbot.exe status
+.\target\release\nestbot.exe restart
 .\target\release\nestbot.exe search "合成关键词" --pages 2
 .\target\release\nestbot.exe search "合成关键词" --all
 .\target\release\nestbot.exe search "合成关键词" --resume
@@ -54,11 +55,15 @@ CLI 搜索默认一页；Bot `/search` 默认搜全页。原 Python 业务规则
 
 不解释机器人文字/弹窗是否要求等待，也不按返回秒数自动冷却或重试。Telegram RPC 或 Bot API 明确返回限流错误时，停止当前任务并显示 `telegram_rate_limited`，保留已完成文件及转存账本；不会立即重试或循环请求。进度消息编辑被限流时停止该消息的自动更新，可使用 `/status` 查看。后续只根据实际提供的机器人消息格式另行设计处理，当前版本没有自动等待功能。
 
+提取会在首个文件到达前等待，已知文件数量尚未收齐时不会因 8 秒静默提前结束；整个收集过程受 `claim_timeout_secs` 总超时约束。超时或普通失败的任务显示 `partial`，可用 `/retry 任务ID` 手动重试。收集期间遇到 Telegram 明确限流时立即停止请求，已收媒体保留在数据库；下次手动重试优先处理这些媒体，再按需要重试剩余部分，不自动等待或重发。
+
 ## Bot
 
 配置 `telegram.allowed_users` 和 `TELEGRAM_BOT_TOKEN`；白名单为空时不接受任务。把 bot 加入目标频道并授予发消息及编辑权限。
 
-支持 `/search`、`/grab`、`/fetch`、`/batch`、`/copy`、`/deep`、`/mode`、`/bind`、`/target`、`/status`、`/stop`、`/clear`、`/retry`、`/chats`、`/log`。转发媒体后自动转存，发送 `#标签` 给最近一批补标。Bot API copy 任务拥有独立执行通道，大文件 deep 任务不会阻塞它。
+支持 `/search`、`/grab`、`/fetch`、`/batch`、`/copy`、`/deep`、`/mode`、`/bind`、`/target`、`/status`、`/stop`、`/clear`、`/retry`、`/restart`、`/chats`、`/log`。转发媒体后自动转存，发送 `#标签` 给最近一批补标。Bot API copy 任务拥有独立执行通道，大文件 deep 任务不会阻塞它。
+
+白名单用户可用 `/restart` 重新初始化 Bot、主账号 Telegram 连接和调度器；CLI 使用 `nestbot restart`。已完成记录保留，被打断的任务按恢复规则重新排队，发送结果不确定的任务进入 `review`。重启沿用当前配置；修改配置文件后仍使用 `deploy/run-local.sh restart` 重启整个进程。Bot 已无法响应时也可用该脚本。
 
 批量转存支持批次 ID、关键词和已导入的旧 `.bin` 文件名，序号从 1 开始，起止都包含。例如 `/batch test 25 25` 只处理第 25 条。未设置目标时，先 `/bind 群ID` 或配置 `default_target`。
 

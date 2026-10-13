@@ -8,7 +8,16 @@ pub mod telegram;
 pub mod telemetry;
 
 pub async fn serve(config: config::Config, store: storage::Store) -> anyhow::Result<()> {
-    let app = application::App::new(config, store)?;
+    loop {
+        let app = application::App::new(config.clone(), store.clone())?;
+        if !serve_once(app).await? {
+            return Ok(());
+        }
+        tracing::info!(event = "service_restarting");
+    }
+}
+
+async fn serve_once(app: std::sync::Arc<application::App>) -> anyhow::Result<bool> {
     app.store.recover().await?;
     // Validate authentication before starting network consumers or accepting jobs.
     let web = if app.config.web.enabled {
@@ -44,7 +53,9 @@ pub async fn serve(config: config::Config, store: storage::Store) -> anyhow::Res
         }
     };
     let result = tokio::select! {
-        _=signal=>Ok(()),
+        biased;
+        _=signal=>Ok(false),
+        _=app.restart.cancelled()=>Ok(true),
         service=services.join_next()=>match service{Some(Ok(Err(error)))=>Err(error),_=>Err(anyhow::anyhow!("service_stopped"))},
     };
     app.shutdown.cancel();
@@ -53,6 +64,11 @@ pub async fn serve(config: config::Config, store: storage::Store) -> anyhow::Res
     loop {
         tokio::select! {_= &mut deadline=>{services.abort_all();break;},service=services.join_next()=>{if service.is_none(){break;}}}
     }
+    // Drop aborted tasks and their account references before creating new connections.
+    while services.join_next().await.is_some() {}
     tracing::info!(event = "service_stopped");
     result
 }
+
+#[cfg(test)]
+mod restart_tests;

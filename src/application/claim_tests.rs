@@ -165,6 +165,7 @@ async fn replay_attempt(
     let (tx, rx) = tokio::sync::broadcast::channel(4);
     drop(tx);
     tokio::time::pause();
+    let protocol_started = tokio::time::Instant::now();
     let task = tokio::spawn(collect(
         source,
         store.clone(),
@@ -187,8 +188,14 @@ async fn replay_attempt(
         std::thread::sleep(Duration::from_millis(2));
         tokio::task::yield_now().await;
     }
+    assert!(task.is_finished(), "collector exceeded its total deadline");
     let collected = task.await.unwrap().unwrap();
-    (collected, store, dir)
+    let elapsed = protocol_started.elapsed();
+    assert!(elapsed <= Duration::from_secs(timeout + 10));
+    if elapsed >= Duration::from_secs(timeout) {
+        assert!(collected.incomplete, "timeout cannot mark a claim complete");
+    }
+    (collected.count, store, dir)
 }
 
 #[tokio::test]
@@ -365,6 +372,93 @@ async fn processing_reply_and_callback_do_not_interrupt_the_first_key() {
             .unwrap(),
         vec![2]
     );
+}
+
+#[tokio::test]
+async fn processing_without_buttons_waits_for_delayed_first_media() {
+    let source = Replay::new(vec![message(1, None, false)], vec![]);
+    let messages = source.messages.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        messages.lock().unwrap().push(message(2, None, true));
+    });
+    let (count, _, _) = replay_attempt(source, Some(1), 60).await;
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn known_count_waits_past_quiet_window_for_remaining_media() {
+    let source = Replay::new(vec![message(1, None, true)], vec![]);
+    let messages = source.messages.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        messages.lock().unwrap().push(message(2, None, true));
+    });
+    let (count, _, _) = replay_attempt(source, Some(2), 60).await;
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn continuous_processing_updates_cannot_extend_total_deadline() {
+    let source = Replay::new(vec![message(1, None, false)], vec![]);
+    let messages = source.messages.clone();
+    let updater = tokio::spawn(async move {
+        for id in 2..100 {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            messages.lock().unwrap().push(message(id, None, false));
+        }
+    });
+    let (count, _, _) = replay_attempt(source, None, 30).await;
+    updater.abort();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn rate_limited_collection_preserves_inbox_for_manual_retry() {
+    let source = Replay::new(
+        vec![
+            message(1, None, true),
+            message(2, Some("下一组 (2/2)"), false),
+        ],
+        vec![],
+    );
+    source
+        .answers
+        .lock()
+        .await
+        .push_back(Err(RateLimited.into()));
+    let (_dir, app) = crate::restart_tests::fixture();
+    let peer = message(0, None, false).peer_ref().await.unwrap().unwrap();
+    let (tx, rx) = tokio::sync::broadcast::channel(4);
+    drop(tx);
+    tokio::time::pause();
+    let task = tokio::spawn(collect(
+        source.clone(),
+        app.store.clone(),
+        "job".into(),
+        "claim".into(),
+        peer,
+        0,
+        Some(2),
+        60,
+        90,
+        CancellationToken::new(),
+        rx,
+    ));
+    for _ in 0..100 {
+        if task.is_finished() {
+            break;
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        std::thread::sleep(Duration::from_millis(2));
+        tokio::task::yield_now().await;
+    }
+    assert!(task.is_finished());
+    assert!(task.await.unwrap().unwrap_err().is::<RateLimited>());
+    assert_eq!(source.clicks.lock().unwrap().len(), 1);
+    assert_eq!(pending_count(&app.store, "job", "claim").await.unwrap(), 1);
+    app.store.inbox_done("job", "claim", 1).await.unwrap();
+    assert_eq!(pending_count(&app.store, "job", "claim").await.unwrap(), 0);
 }
 
 #[tokio::test]

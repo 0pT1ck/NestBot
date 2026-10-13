@@ -665,7 +665,7 @@ pub async fn handle(app: &App, value: &Value) -> anyhow::Result<()> {
             .next()
             .unwrap_or("");
         if ![
-            "/bind", "/target", "/status", "/stop", "/clear", "/log", "/start", "/help",
+            "/bind", "/target", "/status", "/stop", "/clear", "/restart", "/log", "/start", "/help",
         ]
         .contains(&cmd)
         {
@@ -743,6 +743,10 @@ pub async fn handle(app: &App, value: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+#[path = "bot_tests.rs"]
+mod tests;
+
 pub async fn command(
     app: &App,
     chat: i64,
@@ -755,7 +759,17 @@ pub async fn command(
     }
     let command = words[0].split('@').next().unwrap_or(words[0]);
     match command {
-        "/start"|"/help"=>Ok("归巢 Rust\n转发媒体自动转存；#标签 补标\n/search 关键词 [页数|continue]\n/grab 密钥…：copy\n/fetch 密钥…：deep\n/batch：批次列表\n/batch 名称或ID [起] [止] [redo]\n/batch 名称 progress 已转条数\n/copy /deep /mode\n/bind 群ID；/target\n/status /stop [任务ID] /clear\n/retry 任务ID\n/chats：账号群组\n/log：最近运行事件\nWeb 管理通过本机 8787 端口访问。".into()),
+        "/start"|"/help"=>Ok("归巢 Rust\n转发媒体自动转存；#标签 补标\n/search 关键词 [页数|continue]\n/grab 密钥…：copy\n/fetch 密钥…：deep\n/batch：批次列表\n/batch 名称或ID [起] [止] [redo]\n/batch 名称 progress 已转条数\n/copy /deep /mode\n/bind 群ID；/target\n/status /stop [任务ID] /clear\n/retry 任务ID\n/restart：重启 Bot 和连接，恢复队列\n/chats：账号群组\n/log：最近运行事件\nWeb 管理通过本机 8787 端口访问。".into()),
+        "/restart"=>{
+            if words.len()!=1 {return Ok("用法：/restart；重启服务并恢复未完成队列。".into());}
+            // Persist the acknowledgement before requesting restart to prevent replay loops.
+            if let Some(update)=update {
+                app.store.set_preference("bot_offset",&(update+1).to_string()).await?;
+            }
+            send(app,chat,"正在重启 Bot、Telegram 连接和任务调度器，已完成记录保留；未完成任务将按恢复规则处理。发送 /status 查看重启后的状态。").await;
+            app.restart.cancel();
+            Ok(String::new())
+        },
         "/copy"|"/deep"=>{let mode=&command[1..];app.store.set_preference("mode",mode).await?;Ok(format!("已切换为 {mode}。"))},
         "/mode"=>Ok(format!("当前模式：{}",app.mode().await?.as_str())),
         "/target"=>Ok(format!("目标：{}",app.target().await?)),
@@ -853,6 +867,9 @@ pub async fn run(app: Arc<App>) -> anyhow::Result<()> {
             }
         };
         for update in updates {
+            if app.shutdown.is_cancelled() || app.restart.is_cancelled() {
+                break;
+            }
             let value = serde_json::to_value(update)?;
             let next = value
                 .get("update_id")

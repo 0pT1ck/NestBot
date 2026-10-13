@@ -7,6 +7,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
     Status,
+    Restart,
     Submit { payload: JobPayload },
     Jobs { limit: u32, offset: u32 },
     Cancel { id: String },
@@ -36,6 +37,7 @@ pub async fn execute(app: &App, action: Action) -> anyhow::Result<serde_json::Va
         Action::Status => {
             serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"jobs":app.store.jobs(10,0).await?,"target":app.target().await?,"mode":app.mode().await?,"limits":app.config.limits,"bot_configured":app.bot.is_some(),"web_enabled":app.config.web.enabled,"memory_rss_bytes":rss()})
         }
+        Action::Restart => serde_json::json!({"ok":true,"restarting":true}),
         Action::Submit { payload } => {
             serde_json::json!({"id":app.enqueue(payload,None,None).await?})
         }
@@ -133,6 +135,7 @@ where
         bool::from(request.token.as_bytes().ct_eq(token.as_bytes())),
         "unauthorized"
     );
+    let restart = matches!(request.action, Action::Restart);
     let response = match execute(&app, request.action).await {
         Ok(data) => serde_json::json!({"ok":true,"data":data}),
         Err(error) => serde_json::json!({"ok":false,"error":crate::telemetry::safe_error(&error)}),
@@ -140,6 +143,9 @@ where
     let mut body = serde_json::to_vec(&response)?;
     body.push(b'\n');
     tokio::time::timeout(Duration::from_secs(10), reader.get_mut().write_all(&body)).await??;
+    if restart {
+        app.restart.cancel();
+    }
     Ok(())
 }
 

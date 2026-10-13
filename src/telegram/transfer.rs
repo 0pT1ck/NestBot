@@ -157,6 +157,26 @@ fn document_info(
     )
 }
 
+fn upload_error(error: std::io::Error) -> anyhow::Error {
+    // grammers wraps upload RPC failures with io::Error::other.
+    if matches!(
+        error.get_ref().and_then(|error| error.downcast_ref::<grammers_mtsender::InvocationError>()),
+        Some(grammers_mtsender::InvocationError::Rpc(error)) if error.code == 420
+    ) {
+        super::RateLimited.into()
+    } else {
+        anyhow::anyhow!("upload_failed")
+    }
+}
+
+fn optional_thumbnail<T>(result: anyhow::Result<T>) -> anyhow::Result<Option<T>> {
+    match result {
+        Ok(uploaded) => Ok(Some(uploaded)),
+        Err(error) if error.is::<super::RateLimited>() => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn upload(
     app: &App,
@@ -185,7 +205,7 @@ async fn upload(
     let uploaded = loop {
         tokio::select! {
             _=cancel.cancelled()=>anyhow::bail!("cancelled"),
-            result=&mut future=>break result.map_err(|_|anyhow::anyhow!("upload_failed"))?,
+            result=&mut future=>break result.map_err(upload_error)?,
             _=tick.tick()=>{
                 let active_time=clock.elapsed();
                 let bytes=count.load(Ordering::Relaxed);
@@ -234,7 +254,7 @@ async fn upload(
                 .client
                 .upload_file(&temp)
                 .await
-                .map_err(|_| anyhow::anyhow!("upload_failed"))?;
+                .map_err(upload_error)?;
             Ok(uploaded)
         })
         .await;
@@ -242,7 +262,7 @@ async fn upload(
         if cancel.is_cancelled() {
             anyhow::bail!("cancelled");
         }
-        if let Ok(uploaded) = result {
+        if let Some(uploaded) = optional_thumbnail(result)? {
             input = input.thumbnail(uploaded);
         }
     }
@@ -582,5 +602,78 @@ pub async fn incoming(
         }
         app.store.save_report(&job.summary.id, &report).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+    use grammers_mtsender::{InvocationError, RpcError};
+
+    fn upload_rpc_error(code: i32, name: &str) -> std::io::Error {
+        // Match the concrete wrapper returned by grammers upload_stream/upload_file.
+        std::io::Error::other(InvocationError::Rpc(RpcError {
+            code,
+            name: name.into(),
+            value: Some(8),
+            caused_by: None,
+        }))
+    }
+
+    #[test]
+    fn upload_rpc_420_is_typed_rate_limited() {
+        for name in ["FLOOD_WAIT", "FLOOD_PREMIUM_WAIT", "SLOWMODE_WAIT"] {
+            let error = upload_error(upload_rpc_error(420, name));
+            assert!(error.is::<super::super::RateLimited>());
+            assert_eq!(error.to_string(), "telegram_rate_limited");
+        }
+    }
+
+    #[test]
+    fn other_upload_errors_remain_upload_failed() {
+        for error in [
+            upload_rpc_error(400, "FILE_PART_INVALID"),
+            upload_rpc_error(500, "INTERNAL"),
+            std::io::Error::other(InvocationError::Dropped),
+            std::io::Error::other(InvocationError::Io(std::io::Error::from(
+                std::io::ErrorKind::ConnectionReset,
+            ))),
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+            std::io::Error::other("FLOOD_WAIT_8"),
+        ] {
+            let error = upload_error(error);
+            assert!(!error.is::<super::super::RateLimited>());
+            assert_eq!(error.to_string(), "upload_failed");
+        }
+    }
+
+    #[test]
+    fn optional_thumbnail_propagates_download_and_upload_rate_limits() {
+        let invocation = InvocationError::Rpc(RpcError {
+            code: 420,
+            name: "FLOOD_WAIT".into(),
+            value: Some(8),
+            caused_by: None,
+        });
+        for error in [
+            rpc(invocation),
+            upload_error(upload_rpc_error(420, "FLOOD_WAIT")),
+        ] {
+            let result = optional_thumbnail::<()>(Err(error));
+            assert!(result.unwrap_err().is::<super::super::RateLimited>());
+        }
+        assert_eq!(optional_thumbnail(Ok(42)).unwrap(), Some(42));
+        assert_eq!(
+            optional_thumbnail::<()>(Err(upload_error(upload_rpc_error(
+                400,
+                "FILE_PART_INVALID"
+            ))))
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            optional_thumbnail::<()>(Err(anyhow::anyhow!("telegram_timeout"))).unwrap(),
+            None
+        );
     }
 }

@@ -1,5 +1,34 @@
-use crate::{application::App, telegram::RateLimited, telemetry};
+use crate::{application::App, domain::JobReport, telegram::RateLimited, telemetry};
 use std::{sync::Arc, time::Duration};
+
+fn final_status(
+    result: &anyhow::Result<()>,
+    kind: &str,
+    report: &JobReport,
+    uncertain: bool,
+    shutdown: bool,
+    cancelled: bool,
+) -> (&'static str, Option<&'static str>) {
+    let partial = (kind == "search"
+        && report
+            .warnings
+            .iter()
+            .any(|warning| warning == "search_page_stalled"))
+        || (kind == "transfer" && (report.failed_keys > 0 || report.failed_files > 0))
+        || report
+            .warnings
+            .iter()
+            .any(|warning| warning == "claim_incomplete");
+    match result {
+        Ok(()) if partial => ("partial", None),
+        Ok(()) => ("completed", None),
+        Err(_) if uncertain => ("review", Some("transfer_uncertain")),
+        Err(_) if shutdown => ("interrupted", None),
+        Err(_) if cancelled => ("cancelled", None),
+        Err(error) if error.is::<RateLimited>() => ("failed", Some("telegram_rate_limited")),
+        Err(error) => ("failed", Some(telemetry::safe_error(error))),
+    }
+}
 
 pub async fn worker(app: Arc<App>, fast: bool) -> anyhow::Result<()> {
     loop {
@@ -30,17 +59,14 @@ pub async fn worker(app: Arc<App>, fast: bool) -> anyhow::Result<()> {
                     .warnings
                     .iter()
                     .any(|warning| warning == "search_page_stalled");
-            let (status, error) = match &result {
-                Ok(()) if partial_search => ("partial", None),
-                Ok(()) => ("completed", None),
-                Err(_) if uncertain => ("review", Some("transfer_uncertain")),
-                Err(_) if app.shutdown.is_cancelled() => ("interrupted", None),
-                Err(_) if token.is_cancelled() => ("cancelled", None),
-                Err(error) if error.is::<RateLimited>() => {
-                    ("failed", Some("telegram_rate_limited"))
-                }
-                Err(error) => ("failed", Some(telemetry::safe_error(error))),
-            };
+            let (status, error) = final_status(
+                &result,
+                &job.summary.kind,
+                &report,
+                uncertain,
+                app.shutdown.is_cancelled(),
+                token.is_cancelled(),
+            );
             app.store
                 .finish(&job.summary.id, status, error, None)
                 .await?;
@@ -102,4 +128,111 @@ pub async fn worker(app: Arc<App>, fast: bool) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(kind: &str, report: &JobReport) -> (&'static str, Option<&'static str>) {
+        final_status(&Ok(()), kind, report, false, false, false)
+    }
+
+    #[test]
+    fn successful_transfer_with_failed_keys_or_files_finishes_partial() {
+        for (failed_keys, failed_files) in [(1, 0), (0, 1), (2, 3)] {
+            let report = JobReport {
+                failed_keys,
+                failed_files,
+                ..Default::default()
+            };
+            assert_eq!(status("transfer", &report), ("partial", None));
+        }
+        let report = JobReport {
+            files: 2,
+            skipped_keys: 3,
+            skipped_files: 4,
+            warnings: vec!["optional_thumbnail_missing".into()],
+            ..Default::default()
+        };
+        assert_eq!(status("transfer", &report), ("completed", None));
+    }
+
+    #[test]
+    fn claim_incomplete_finishes_partial_and_search_partial_is_preserved() {
+        let report = JobReport {
+            warnings: vec!["claim_incomplete".into()],
+            ..Default::default()
+        };
+        assert_eq!(status("transfer", &report), ("partial", None));
+        assert_eq!(status("claim", &report), ("partial", None));
+        let report = JobReport {
+            pages: 2,
+            warnings: vec!["search_page_stalled".into()],
+            ..Default::default()
+        };
+        assert_eq!(status("search", &report), ("partial", None));
+        assert_eq!(status("transfer", &report), ("completed", None));
+        assert_eq!(status("search", &JobReport::default()), ("completed", None));
+    }
+
+    #[test]
+    fn successful_retry_finishes_completed_with_previous_success_counts() {
+        let previous = JobReport {
+            files: 2,
+            skipped_keys: 3,
+            skipped_files: 4,
+            failed_keys: 1,
+            failed_files: 1,
+            warnings: vec!["claim_incomplete".into()],
+            ..Default::default()
+        };
+        assert_eq!(status("transfer", &previous), ("partial", None));
+        // Execution resets attempt failures; cumulative successes remain in the report.
+        let retried = JobReport {
+            files: previous.files + 1,
+            failed_keys: 0,
+            failed_files: 0,
+            warnings: vec![],
+            ..previous
+        };
+        assert_eq!(status("transfer", &retried), ("completed", None));
+    }
+
+    #[test]
+    fn execution_errors_keep_existing_status_precedence_even_with_partial_report() {
+        let report = JobReport {
+            failed_files: 1,
+            warnings: vec!["claim_incomplete".into()],
+            ..Default::default()
+        };
+        let result = Err(anyhow::Error::new(RateLimited));
+        for (uncertain, shutdown, cancelled, expected) in [
+            (true, true, true, ("review", Some("transfer_uncertain"))),
+            (false, true, true, ("interrupted", None)),
+            (false, false, true, ("cancelled", None)),
+            (
+                false,
+                false,
+                false,
+                ("failed", Some("telegram_rate_limited")),
+            ),
+        ] {
+            assert_eq!(
+                final_status(&result, "transfer", &report, uncertain, shutdown, cancelled),
+                expected
+            );
+        }
+        assert_eq!(
+            final_status(
+                &Err(anyhow::anyhow!("upload_failed")),
+                "transfer",
+                &report,
+                false,
+                false,
+                false
+            ),
+            ("failed", Some("upload_failed"))
+        );
+    }
 }
