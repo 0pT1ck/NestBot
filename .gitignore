@@ -1,0 +1,16 @@
+/target/
+/tmp/
+/data/
+/logs/
+/run/
+/backups/
+/config/*.toml
+!/config/*.example.toml
+/config/*.env
+.env
+*.session
+*.session-*
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*

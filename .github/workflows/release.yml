@@ -1,0 +1,99 @@
+name: Build and release NestBot
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_HOME: ${{ github.workspace }}/tmp/cargo-home
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      TMPDIR: ${{ github.workspace }}/tmp/build
+      CARGO_HTTP_MULTIPLEXING: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare local build directories
+        run: mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR" "$TMPDIR"
+      - name: Select Rust stable
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add rustfmt clippy
+      - name: Validate source
+        run: |
+          cargo fmt --check
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
+          for script in deploy/*.sh scripts/*.sh tests/*.sh; do sh -n "$script"; done
+          sh tests/bootstrap-smoke.sh
+      - name: Build and package
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          cargo build --locked --release
+          VERSION=$(target/release/nestbot --version | cut -d ' ' -f 2)
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            printf '%s\n' 'Tag must match Cargo package version' >&2
+            exit 1
+          fi
+          sh scripts/package.sh
+          mkdir -p target/dist
+          set -- target/nestbot-"$ARCH"-linux.*.tar.gz
+          [ "$#" -eq 1 ]
+          cp "$1" "target/dist/nestbot-v$VERSION-$ARCH-linux.tar.gz"
+      - name: Validate packaged install on Linux
+        run: |
+          ROOT="$GITHUB_WORKSPACE/tmp/linux install"
+          mkdir -m 700 "$ROOT"
+          tar --no-same-owner --no-same-permissions -xzf target/dist/*.tar.gz -C "$ROOT"
+          sh "$ROOT/scripts/install.sh" --root "$ROOT"
+          sh "$ROOT/scripts/install.sh" --root "$ROOT"
+          "$ROOT/bin/nestbot" --version
+          code=0; "$ROOT/bin/nestbot" --root "$ROOT" status || code=$?
+          [ "$code" -eq 3 ]
+          "$ROOT/bin/nestbot" --root "$ROOT" stop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nestbot-${{ matrix.arch }}
+          path: target/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: linux
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: nestbot-*
+          path: dist
+          merge-multiple: true
+      - name: Create release and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          sha256sum nestbot-*.tar.gz > SHA256SUMS
+          gh release create "$TAG" nestbot-*.tar.gz SHA256SUMS \
+            --verify-tag --title "NestBot $TAG" \
+            --notes 'First NestBot release. Linux x86_64/aarch64, glibc 2.39 or newer. Single-directory installation; configure credentials and log in locally before starting. Telegram end-to-end and memory acceptance remain pending. See README for limitations.'

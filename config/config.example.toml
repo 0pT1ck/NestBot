@@ -1,0 +1,10 @@
+# Copy to config/config.toml; keep real credentials out of Git.
+api_id = 0
+api_hash = ""
+bot_token = ""
+owner_id = 0
+# Bot API ID of the private relay supergroup (typically starts with -100).
+relay_chat_id = 0
+queue_capacity = 128
+max_rules = 256
+task_ttl_secs = 60
